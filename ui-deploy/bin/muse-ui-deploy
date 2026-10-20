@@ -1,0 +1,3 @@
+#!/bin/sh
+# Installed root:root 0755 at /usr/local/bin/muse-ui-deploy. The ONLY thing muse-ui may execute as muse-deploy.
+exec /usr/bin/sudo -n -u muse-deploy /opt/muse-ui/bin/deploy-priv "$@"

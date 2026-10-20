@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Muse Control</title>
+<link rel="icon" type="image/svg+xml" href="/static/icon.svg">
+<link rel="icon" type="image/png" sizes="32x32" href="/static/icon-32.png">
+<link rel="apple-touch-icon" sizes="180x180" href="/static/icon-180.png">
+<meta name="theme-color" content="#F7F7F5" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#111113" media="(prefers-color-scheme: dark)">
+<script src="/static/theme.js"></script>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div class="page">
+  <header>
+    <div>
+      <h1>Muse</h1>
+      <div class="today" id="today"></div>
+    </div>
+    <div class="right">
+      <div class="pulse" id="pulse"><span class="dot"></span><span id="pulse-text">Connecting…</span></div>
+      <button id="theme-toggle" type="button" aria-label="Toggle dark mode"></button>
+    </div>
+  </header>
+  <nav id="nav" aria-label="Views">
+    <a href="#home" data-view="home">Home</a>
+    <a href="#week" data-view="week">Week</a>
+    <a href="#timeline" data-view="timeline">Timeline</a>
+    <a href="#log" data-view="log">Log</a>
+    <a href="#system" data-view="system">System</a>
+  </nav>
+
+  <main>
+    <div class="view" id="view-home">
+      <div id="context-line" class="ctx" hidden></div>
+      <section id="focus" class="hero"><h2>MUSE RECOMMENDS</h2><div class="body"></div></section>
+      <section id="needs-you" class="card" hidden><h2>NEEDS YOU</h2><div class="body"></div></section>
+      <section id="upcoming" class="card" hidden><h2>UPCOMING</h2><div class="body"></div></section>
+      <section id="in-progress" class="card" hidden><h2>IN PROGRESS</h2><div class="body"></div></section>
+      <section id="matters" class="card"><h2>ALL MATTERS</h2><div class="body"></div></section>
+    </div>
+    <div class="view" id="view-week" hidden>
+      <section id="week-grid" class="card"><h2>7 DAYS</h2><div class="body"></div></section>
+    </div>
+    <div class="view" id="view-timeline" hidden>
+      <section id="timeline-full" class="card"><h2>TIMELINE</h2><div class="body"></div></section>
+    </div>
+    <div class="view" id="view-log" hidden>
+      <section id="log" class="card"><h2>LOG</h2><div class="body"></div></section>
+    </div>
+    <div class="view" id="view-system" hidden>
+      <section id="routines" class="card"><h2>ROUTINES</h2><div class="body"></div></section>
+      <section id="system-status" class="card"><h2>SYSTEM</h2><div class="body"></div></section>
+    </div>
+  </main>
+</div>
+<script src="/_ui/actions.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,4 @@
+FROM python:3.12-slim
+WORKDIR /srv
+COPY requirements.txt requirements-dev.txt ./
+RUN pip install -q --no-cache-dir -r requirements-dev.txt

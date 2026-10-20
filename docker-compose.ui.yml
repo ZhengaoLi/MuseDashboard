@@ -1,0 +1,6 @@
+# Overlay: serve the dashboard frontend from the protected, deploy-managed live directory (read-only).
+# Enabled by install.sh via COMPOSE_FILE in .env. Do not start before /srv/muse-ui/live exists.
+services:
+  muse-control:
+    volumes:
+      - /srv/muse-ui/live:/srv/app/static:ro

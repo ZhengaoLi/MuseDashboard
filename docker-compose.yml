@@ -1,0 +1,21 @@
+services:
+  muse-control:
+    build: .
+    image: muse-control:latest
+    container_name: muse-control
+    restart: unless-stopped
+    environment:
+      MUSE_TOKEN: ${MUSE_TOKEN:?set MUSE_TOKEN in .env}
+      MUSE_HUMAN_TOKEN: ${MUSE_HUMAN_TOKEN:-}
+      CHRONICLE_TOKEN: ${CHRONICLE_TOKEN:-}
+      TZ: ${TZ:-UTC}
+      FRESH_MINUTES: ${FRESH_MINUTES:-60}
+      STALE_MINUTES: ${STALE_MINUTES:-360}
+    ports:
+      # private access only: loopback + Tailscale. Never bind the public/campus interface.
+      - "127.0.0.1:5050:5050"
+      - "${MUSE_BIND_TAILSCALE:-127.0.0.2}:5050:5050"
+    volumes:
+      - muse_data:/data
+volumes:
+  muse_data:

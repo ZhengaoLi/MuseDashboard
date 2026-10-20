@@ -1,0 +1,504 @@
+#!/usr/bin/python3 -I
+"""muse-ui-deploy: protected frontend deployment (runs as the muse-deploy user, root-owned code).
+
+Muse never runs this file directly; /usr/local/bin/muse-ui-deploy forwards to it via a fixed sudoers rule.
+Modes: (default) deploy | --check | --preview | --preview-stop | --status | --rollback [ID] | --report | --init
+"""
+import argparse, errno, fcntl, hashlib, json, os, re, secrets, shutil, stat, subprocess, sys, time, urllib.request, urllib.error
+from datetime import datetime, timezone
+
+CONFIG = "/opt/muse-ui/config.json"
+if os.environ.get("MUSE_UI_DEV") == "1" and not os.environ.get("SUDO_USER") and os.environ.get("MUSE_UI_CONFIG"):
+    CONFIG = os.environ["MUSE_UI_CONFIG"]          # dev/test only; sudo scrubs env so Muse cannot set this
+C = json.load(open(CONFIG))
+ROOT = C["root"]
+WS, LIVE, REL, REP, STG = (os.path.join(ROOT, p) for p in ("workspace", "live", "releases", "reports", "staging"))
+STATE = os.path.join(REL, ".state.json")   # inside a muse-deploy-owned dir ($ROOT itself is root-owned)
+DOCKER = C.get("docker", "/usr/bin/docker")
+ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "HOME": C.get("home", "/tmp"), "LANG": "C.UTF-8"}
+
+EXT = {".html", ".css", ".js", ".svg", ".png", ".jpg", ".jpeg", ".webp", ".woff2", ".ico"}
+TEXT_EXT = {".html", ".css", ".js", ".svg"}
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+MAX_FILE, MAX_TOTAL, MAX_FILES, MAX_DEPTH = 512 * 1024, 4 * 1024 * 1024, 80, 4
+TOP_OK_FILES = {"README.md", "NOTES.md", "CHANGELOG.md"}
+BANNED = [  # (regex, applies to ext set, reason)
+    (r"/api/update", TEXT_EXT, "frontend must never call the write API"),
+    (r"\bAuthorization\b|\bBearer\b", TEXT_EXT, "no credentials in frontend code"),
+    (r"method\s*:\s*['\"`]?(POST|PUT|PATCH|DELETE)", {".js", ".html"}, "frontend is read-only (GET only)"),
+    (r"sendBeacon|XMLHttpRequest|WebSocket|EventSource|importScripts|serviceWorker", {".js", ".html"}, "disallowed network/worker API"),
+    (r"\.(innerHTML|outerHTML)\b|insertAdjacentHTML|document\.write|DOMParser|\beval\s*\(|new\s+Function\s*\(", {".js", ".html"}, "unsafe HTML/code injection API (use textContent/createElement)"),
+    (r"<\s*(form|input|textarea|select|iframe|object|embed)\b|contenteditable", {".html"}, "no typing controls or embeds (clicks only; interaction is provided by /_ui/actions.js)"),
+    (r"createElement\(\s*['\"](form|input|textarea|select|iframe|object|embed)['\"]", {".js"}, "no typing controls or embeds"),
+    (r"/api/action|/api/context|muse-human-token|sensitive_ack", {".js", ".html"}, "frontend must not talk to the action API or touch the token: mark buttons with data-act/data-section/data-id instead"),
+    (r"<\s*script", {".svg"}, "no scripts in SVG"),
+    (r"(https?:)?//[A-Za-z0-9.-]+\.[a-z]{2,}", {".html", ".css", ".js"}, "no external URLs (self-contained only)"),
+]
+
+
+class Reject(Exception):
+    def __init__(self, reasons): self.reasons = reasons if isinstance(reasons, list) else [reasons]
+
+
+def now_id(): return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+def log(*a): print(*a, flush=True)
+
+
+def run(args, timeout=300, check=False, **kw):
+    r = subprocess.run(args, env=ENV, capture_output=True, text=True, timeout=timeout, **kw)
+    if check and r.returncode:
+        raise RuntimeError("%s failed: %s" % (args[:3], (r.stderr or r.stdout)[-800:]))
+    return r
+
+
+def dk(*args, **kw): return run([DOCKER, *args], **kw)
+
+
+# ---------- safe snapshot of the workspace -------------------------------------------------
+def snapshot(src, dst):
+    """Copy allowlisted regular files from workspace/static into dst without following symlinks.
+    Returns manifest {relpath: sha256}. Raises Reject with every problem found."""
+    problems, manifest, total = [], {}, 0
+    try:
+        top = os.open(src, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as e:
+        raise Reject("workspace missing or is a symlink: %s" % e.strerror)
+    with os.scandir(top) as it:
+        for e in it:
+            if e.name in (".git", ".gitignore") or e.name in TOP_OK_FILES and e.is_file(follow_symlinks=False):
+                continue
+            if e.name == "static" and e.is_dir(follow_symlinks=False):
+                continue
+            problems.append("outside allowed frontend files: %s (only static/ and %s are allowed at workspace top level)" % (e.name, ", ".join(sorted(TOP_OK_FILES))))
+    try:
+        sfd = os.open("static", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=top)
+    except OSError as e:
+        raise Reject(problems + ["static/ missing or not a real directory (%s)" % e.strerror])
+
+    def walk(dfd, rel, depth):
+        nonlocal total
+        if depth > MAX_DEPTH:
+            problems.append("too deep: static/%s" % rel); return
+        with os.scandir(dfd) as it:
+            entries = sorted(it, key=lambda x: x.name)
+        for e in entries:
+            r = (rel + "/" + e.name) if rel else e.name
+            if not NAME_RE.match(e.name):
+                problems.append("illegal file name (use [A-Za-z0-9._-], no leading dot): static/%s" % r); continue
+            try:
+                st = os.lstat(e.name, dir_fd=dfd)
+            except OSError:
+                problems.append("vanished during snapshot: static/%s" % r); continue
+            if stat.S_ISLNK(st.st_mode):
+                problems.append("symlink not allowed: static/%s" % r); continue
+            if stat.S_ISDIR(st.st_mode):
+                try:
+                    sub = os.open(e.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dfd)
+                except OSError:
+                    problems.append("cannot open directory safely: static/%s" % r); continue
+                try: walk(sub, r, depth + 1)
+                finally: os.close(sub)
+                continue
+            if not stat.S_ISREG(st.st_mode):
+                problems.append("not a regular file: static/%s" % r); continue
+            if os.path.splitext(e.name)[1].lower() not in EXT:
+                problems.append("file type not allowed: static/%s (allowed: %s)" % (r, " ".join(sorted(EXT)))); continue
+            try:
+                fd = os.open(e.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
+            except OSError:
+                problems.append("cannot open safely: static/%s" % r); continue
+            try:
+                fst = os.fstat(fd)
+                if not stat.S_ISREG(fst.st_mode) or fst.st_nlink != 1:
+                    problems.append("hard links not allowed: static/%s" % r); continue
+                if fst.st_size > MAX_FILE:
+                    problems.append("file too large (>%dKB): static/%s" % (MAX_FILE // 1024, r)); continue
+                data = os.read(fd, MAX_FILE + 1)
+                while len(data) < fst.st_size:
+                    more = os.read(fd, MAX_FILE + 1)
+                    if not more: break
+                    data += more
+            finally:
+                os.close(fd)
+            total += len(data)
+            manifest[r] = hashlib.sha256(data).hexdigest()
+            out = os.path.join(dst, r)
+            os.makedirs(os.path.dirname(out), exist_ok=True)
+            with open(out, "wb") as f: f.write(data)
+            os.chmod(out, 0o644)
+            ext = os.path.splitext(e.name)[1].lower()
+            if ext in TEXT_EXT:
+                try: text = data.decode("utf-8")
+                except UnicodeDecodeError:
+                    problems.append("not valid UTF-8: static/%s" % r); continue
+                for rx, exts, why in BANNED:
+                    if ext in exts:
+                        m = re.search(rx, text, re.I)
+                        if m: problems.append("static/%s: %s (matched %r)" % (r, why, m.group(0)[:40]))
+    os.makedirs(dst, exist_ok=True)
+    try: walk(sfd, "", 0)
+    finally: os.close(sfd); os.close(top)
+    if len(manifest) > MAX_FILES: problems.append("too many files (%d > %d)" % (len(manifest), MAX_FILES))
+    if total > MAX_TOTAL: problems.append("total size too large")
+    if "index.html" not in manifest: problems.append("static/index.html is required")
+    elif b"/_ui/actions.js" not in open(os.path.join(dst, "index.html"), "rb").read(): problems.append('static/index.html must load the protected interaction layer: <script src="/_ui/actions.js"></script>')
+    if problems: raise Reject(problems)
+    return manifest
+
+
+def manifest_of(d):
+    m = {}
+    for dp, _, fs in os.walk(d):
+        for f in fs:
+            p = os.path.join(dp, f)
+            m[os.path.relpath(p, d)] = hashlib.sha256(open(p, "rb").read()).hexdigest()
+    return m
+
+
+def diff(old, new):
+    return {"added": sorted(set(new) - set(old)), "removed": sorted(set(old) - set(new)),
+            "modified": sorted(k for k in new if k in old and new[k] != old[k])}
+
+
+# ---------- live dir & releases ------------------------------------------------------------
+def apply_live(src_static):
+    want = manifest_of(src_static)
+    for rel in want:
+        dst = os.path.join(LIVE, rel)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        tmp = dst + ".tmp-%d" % os.getpid()
+        shutil.copyfile(os.path.join(src_static, rel), tmp)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, dst)
+    for rel in manifest_of(LIVE):
+        if rel not in want:
+            os.unlink(os.path.join(LIVE, rel))
+    for dp, dn, _ in sorted(os.walk(LIVE, topdown=False)):
+        if dp != LIVE and not os.listdir(dp): os.rmdir(dp)
+
+
+def load_state():
+    try: return json.load(open(STATE))
+    except (OSError, ValueError): return {"known_good": None, "history": []}
+
+
+def save_state(s):
+    tmp = STATE + ".tmp"
+    json.dump(s, open(tmp, "w"), indent=1); os.replace(tmp, STATE)
+
+
+def make_release(static_dir, manifest, note):
+    h = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()[:8]
+    rid = "%s-%s" % (now_id(), h)
+    d = os.path.join(REL, rid)
+    shutil.copytree(static_dir, os.path.join(d, "static"))
+    json.dump({"id": rid, "created": datetime.now(timezone.utc).isoformat(), "note": note, "files": manifest},
+              open(os.path.join(d, "meta.json"), "w"), indent=1)
+    return rid
+
+
+# ---------- HTTP helpers --------------------------------------------------------------------
+def http(url, method="GET", data=None, headers=None, timeout=8):
+    req = urllib.request.Request(url, data=data, method=method, headers=headers or {})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r: return r.status, r.read()
+    except urllib.error.HTTPError as e: return e.code, e.read()
+    except Exception as e: return 0, str(e).encode()
+
+
+def sha(b): return hashlib.sha256(b).hexdigest()
+
+
+def post_check(manifest, label, lite=False):
+    """Verify production serves exactly this frontend and the API contract is intact."""
+    base, probs = C["prod_url"], []
+    time.sleep(0.5)
+    st, body = http(base + "/api/health")
+    if st != 200 or b'"ok"' not in body: probs.append("health check failed (%s)" % st)
+    st, body = http(base + "/")
+    if st != 200 or sha(body) != manifest.get("index.html"): probs.append("GET / does not serve the deployed index.html (%s)" % st)
+    for rel, h in manifest.items():
+        if rel == "index.html": continue
+        st, body = http(base + "/static/" + rel)
+        if st != 200 or sha(body) != h: probs.append("/static/%s mismatch (%s)" % (rel, st))
+    st, body = http(base + "/api/state")
+    try:
+        s = json.loads(body)
+        if st != 200 or not {"muse", "focus", "queue", "deadlines", "projects", "schedule", "automations", "journal"} <= set(s): probs.append("/api/state shape changed")
+    except ValueError: probs.append("/api/state not JSON")
+    st, _ = http(base + "/api/update", "POST", b'{"heartbeat":true}', {"Content-Type": "application/json"})
+    if st != 401: probs.append("unauthenticated write was not rejected (got %s)" % st)
+    st, _ = http(base + "/api/action", "POST", b'{"type":"done","section":"queue","id":"x"}', {"Content-Type": "application/json"})
+    if st not in (401, 503): probs.append("unauthenticated action was not rejected (got %s)" % st)
+    st, _ = http(base + "/api/context/events", "POST", b'{"event":"arrived_home","ts":"2026-01-01T00:00:00+00:00"}', {"Content-Type": "application/json"})
+    if st not in (401, 503): probs.append("unauthenticated context event was not rejected (got %s)" % st)
+    st, _ = http(base + "/api/state", "POST", b"{}")
+    if st != 405: probs.append("dashboard accepts POST to /api/state (got %s)" % st)
+    if not probs:
+        r = run_checks_container("smoke-lite" if lite else "smoke", base, None, os.path.join(REP, label), host_network=True)
+        if not r["ok"]: probs += ["browser smoke: " + c["name"] + ": " + c["detail"] for c in r["checks"] if not c["ok"]]
+    return probs
+
+
+# ---------- validator containers -----------------------------------------------------------
+def sandbox_flags():
+    return ["--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", "512",
+            "--memory", "1g", "--cpus", "2", "--tmpfs", "/tmp:rw,exec,size=256m"]
+
+
+def run_checks_container(mode, base, token, outdir, host_network=False, network=None, staging=None, human=None, chronicle=None):
+    os.makedirs(outdir, exist_ok=True)
+    args = ["run", "--rm", "--user", "%d:%d" % (os.getuid(), os.getgid()), "-e", "HOME=/tmp", "--shm-size", "512m",
+            *sandbox_flags(), "-v", outdir + ":/out"]
+    args += ["--network", "host"] if host_network else ["--network", network]
+    args += [C["validator_image"], "python", "/opt/validator/checks.py", "--mode", mode, "--base", base, "--out", "/out"]
+    if token: args += ["--token", token]
+    if human: args += ["--human-token", human]
+    if chronicle: args += ["--chronicle-token", chronicle]
+    r = dk(*args, timeout=420)
+    try: res = json.load(open(os.path.join(outdir, "checks.json")))
+    except Exception:
+        res = {"ok": False, "checks": [{"name": "checks runner", "ok": False, "detail": (r.stderr or r.stdout)[-600:]}]}
+    return res
+
+
+def validate(stg_static, outdir):
+    """Full validation in throwaway, network-isolated containers. Returns (ok, results)."""
+    rid = os.path.basename(outdir)
+    net, srv, token, htoken = "museval-" + rid.lower(), "museval-srv-" + rid.lower(), secrets.token_hex(16), secrets.token_hex(16)
+    ctoken = secrets.token_hex(16)
+    results = []
+    os.makedirs(outdir, exist_ok=True)
+    try:
+        t = dk("run", "--rm", "--network", "none", "--user", "%d:%d" % (os.getuid(), os.getgid()), "-e", "HOME=/tmp",
+               *sandbox_flags(), "-v", stg_static + ":/opt/ref/app/static:ro", "-w", "/opt/ref", C["validator_image"],
+               "python", "-m", "pytest", "-q", "-p", "no:cacheprovider", "-x", timeout=300)
+        open(os.path.join(outdir, "pytest.log"), "w").write(t.stdout + t.stderr)
+        tail = [l for l in t.stdout.strip().splitlines() if l.strip()][-1:] or [""]
+        results.append({"name": "backend + API test suite (pytest)", "ok": t.returncode == 0, "detail": tail[0]})
+        if t.returncode: return False, results
+        dk("network", "create", "--internal", net, check=True)
+        dk("run", "-d", "--name", srv, "--network", net, "--network-alias", "srv", "--user", "10001:10001",
+           *sandbox_flags(), "-e", "MUSE_TOKEN=" + token, "-e", "MUSE_HUMAN_TOKEN=" + htoken, "-e", "CHRONICLE_TOKEN=" + ctoken, "-e", "MUSE_DB=/tmp/v.db", "-e", "TZ=" + C.get("tz", "UTC"),
+           "-v", stg_static + ":/srv/app/static:ro", C["prod_image"], check=True)
+        r = run_checks_container("validate", "http://srv:5050", token, outdir, network=net, human=htoken, chronicle=ctoken)
+        for c in r["checks"]: results.append(c)
+        return r["ok"], results
+    finally:
+        dk("rm", "-f", srv); dk("network", "rm", net)
+
+
+# ---------- commands -------------------------------------------------------------------------
+def inspect_ws(label):
+    stg = os.path.join(STG, label)
+    shutil.rmtree(stg, ignore_errors=True)
+    os.makedirs(stg, mode=0o755)
+    sdir = os.path.join(stg, "static")
+    manifest = snapshot(WS, sdir)
+    d = diff(manifest_of(LIVE), manifest)
+    return stg, sdir, manifest, d
+
+
+def fmt_diff(d):
+    n = sum(len(v) for v in d.values())
+    out = ["Proposed changes: %d file(s)" % n]
+    for k in ("added", "modified", "removed"):
+        for f in d[k]: out.append("  %-9s static/%s" % (k, f))
+    return "\n".join(out)
+
+
+def cmd_deploy(check_only, simulate_post_fail=False):
+    label = now_id()
+    outdir = os.path.join(REP, label)
+    os.makedirs(outdir, exist_ok=True)
+    rep = {"id": label, "mode": "check" if check_only else "deploy", "ok": False, "stage": "inspect"}
+    def finish(code, msg=None):
+        if msg: log(msg)
+        rep["ok"] = code == 0
+        json.dump(rep, open(os.path.join(outdir, "report.json"), "w"), indent=1, ensure_ascii=False)
+        lt = os.path.join(REP, "latest"); tmp = lt + ".tmp"
+        try: os.unlink(tmp)
+        except OSError: pass
+        os.symlink(label, tmp); os.replace(tmp, lt)
+        for old in sorted(x for x in os.listdir(REP) if x != "latest" and not x.startswith("."))[:-20]:
+            shutil.rmtree(os.path.join(REP, old), ignore_errors=True)
+        shutil.rmtree(os.path.join(STG, label), ignore_errors=True)
+        os.chmod(outdir, 0o755)
+        return code
+    try:
+        stg, sdir, manifest, d = inspect_ws(label)
+    except Reject as e:
+        rep["rejected"] = e.reasons
+        log("REJECTED — workspace violates the frontend allowlist:")
+        for r in e.reasons: log("  - " + r)
+        return finish(2)
+    rep["diff"] = d
+    log(fmt_diff(d))
+    if not any(d.values()):
+        return finish(0, "Nothing to deploy: workspace matches the live frontend.")
+    rep["stage"] = "validate"
+    log("Validating in isolated containers (tests, render, JS errors, desktop+mobile, read-only checks)…")
+    ok, results = validate(sdir, outdir)
+    rep["checks"] = results
+    log("  %d/%d checks passed" % (sum(c["ok"] for c in results), len(results)))
+    for c in results:
+        if not c["ok"]: log("  [FAIL] %s — %s" % (c["name"], c["detail"]))
+    if not ok:
+        return finish(3, "VALIDATION FAILED — nothing deployed. Details: reports/%s/ (checks.json, pytest.log, screenshots)" % label)
+    if check_only:
+        return finish(0, "Validation passed (dry run, nothing deployed). Screenshots: reports/%s/" % label)
+    # ---- deploy with rollback
+    st = load_state()
+    prev = st.get("known_good")
+    if not prev or not os.path.isdir(os.path.join(REL, prev)):
+        return finish(4, "No known-good release recorded; run --init first. Nothing deployed.")
+    rep["stage"] = "deploy"
+    rid = make_release(sdir, manifest, "deployed from workspace")
+    rep["release"], rep["previous"] = rid, prev
+    try:
+        apply_live(os.path.join(REL, rid, "static"))
+        probs = post_check(manifest, label + "-post")
+        if simulate_post_fail: probs.append("simulated post-deploy failure (--simulate-post-failure)")
+    except Exception as e:
+        probs = ["deploy error: %s" % e]
+    if probs:
+        log("POST-DEPLOY CHECK FAILED — rolling back to %s" % prev)
+        for p in probs: log("  - " + p)
+        apply_live(os.path.join(REL, prev, "static"))
+        back = post_check(manifest_of(os.path.join(REL, prev, "static")), label + "-rollback", lite=True)
+        rep["post_failures"], rep["rolled_back_to"], rep["rollback_verified"] = probs, prev, not back
+        st["history"].append({"id": rid, "result": "rolled_back", "at": label}); save_state(st)
+        return finish(5, "ROLLED BACK to %s (verified: %s). Previous frontend is live again." % (prev, "yes" if not back else "NO: " + "; ".join(back)))
+    st["known_good"] = rid
+    st["history"].append({"id": rid, "result": "deployed", "at": label, "previous": prev}); save_state(st)
+    rep["stage"] = "done"
+    return finish(0, "DEPLOYED %s (previous known-good: %s). Health + browser smoke OK." % (rid, prev))
+
+
+def cmd_rollback(target):
+    st = load_state()
+    cur = st.get("known_good")
+    if not target:
+        ok_ids = [h["previous"] for h in reversed(st["history"]) if h.get("result") == "deployed" and h.get("id") == cur]
+        target = ok_ids[0] if ok_ids else None
+    if not target or not re.match(r"^[0-9TZ]+-[0-9a-f]{8}$|^r0000-initial$", target) or not os.path.isdir(os.path.join(REL, target)):
+        log("No valid rollback target. Releases: " + ", ".join(sorted(x for x in os.listdir(REL) if not x.startswith(".")))); return 1
+    mf = json.load(open(os.path.join(REL, target, "meta.json")))["files"]
+    apply_live(os.path.join(REL, target, "static"))
+    probs = post_check(mf, now_id() + "-rollback", lite=True)
+    if probs: log("rollback applied but verification failed:\n  - " + "\n  - ".join(probs)); return 5
+    st["known_good"] = target; st["history"].append({"id": target, "result": "manual_rollback", "at": now_id()}); save_state(st)
+    log("Rolled back to %s and verified." % target); return 0
+
+
+def cmd_status():
+    st = load_state()
+    live = manifest_of(LIVE)
+    kg = st.get("known_good")
+    mf = json.load(open(os.path.join(REL, kg, "meta.json")))["files"] if kg else {}
+    log("known-good release: %s" % kg)
+    log("live matches known-good: %s" % (live == mf))
+    log("releases: " + ", ".join(sorted(x for x in os.listdir(REL) if not x.startswith("."))))
+    for h in st["history"][-5:]: log("  history: %s" % json.dumps(h))
+    try:
+        rep = json.load(open(os.path.join(REP, "latest", "report.json")))
+        log("last run %s (%s): %s%s" % (rep["id"], rep["mode"], "OK" if rep["ok"] else "FAILED", "" if rep["ok"] else " at stage " + rep["stage"]))
+    except Exception: log("no reports yet")
+    return 0
+
+
+def cmd_report():
+    try:
+        d = os.path.realpath(os.path.join(REP, "latest"))
+        rep = json.load(open(os.path.join(d, "report.json")))
+        log(json.dumps(rep, indent=1, ensure_ascii=False))
+        log("files in %s: %s" % (d, ", ".join(sorted(os.listdir(d)))))
+        return 0
+    except Exception as e:
+        log("no report: %s" % e); return 1
+
+
+def cmd_init():
+    st = load_state()
+    if st.get("known_good"): log("already initialised: known-good %s" % st["known_good"]); return 0
+    src = C["initial_static"]
+    os.makedirs(LIVE, exist_ok=True)
+    apply_live(src)
+    mf = manifest_of(src)
+    rid = "r0000-initial"
+    d = os.path.join(REL, rid); shutil.rmtree(d, ignore_errors=True)
+    shutil.copytree(src, os.path.join(d, "static"))
+    json.dump({"id": rid, "created": datetime.now(timezone.utc).isoformat(), "note": "initial frontend", "files": mf}, open(os.path.join(d, "meta.json"), "w"), indent=1)
+    save_state({"known_good": rid, "history": [{"id": rid, "result": "init"}]})
+    log("initialised release %s" % rid); return 0
+
+
+LINK = " area thread merged_into"
+STATE_KEYS = {"threads": "title area template status stage stages summary next_step basis",
+              "inbox": "title detail kind status sensitive options choice area thread due basis",
+              "queue": "title status priority order project note basis" + LINK, "deadlines": "title due status project note basis" + LINK,
+              "projects": "name status progress next_step blockers note basis" + LINK, "schedule": "title start end location status note basis" + LINK,
+              "automations": "name frequency last_run next_run status kind note basis" + LINK}
+
+
+def cmd_preview(stop):
+    name = "muse-ui-preview"
+    dk("rm", "-f", name)
+    if stop: log("preview stopped"); return 0
+    label = "preview-" + now_id()
+    try: stg, sdir, manifest, d = inspect_ws(label)
+    except Reject as e:
+        log("REJECTED:"); [log("  - " + r) for r in e.reasons]; return 2
+    token = secrets.token_hex(16)
+    port = C.get("preview_port", 5051)
+    pub = []
+    for b in C.get("preview_binds", ["127.0.0.1"]): pub += ["-p", "%s:%d:5050" % (b, port)]
+    r = dk("run", "-d", "--name", name, "--user", "10001:10001", *sandbox_flags(), "--restart", "no", *pub,
+           "-e", "MUSE_TOKEN=" + token, "-e", "MUSE_DB=/tmp/p.db", "-e", "TZ=" + C.get("tz", "UTC"),
+           "-v", stg + "/static:/srv/app/static:ro", C["prod_image"])
+    if r.returncode: log("preview failed: " + r.stderr[-300:]); return 1
+    base = "http://127.0.0.1:%d" % port
+    for _ in range(30):
+        if http(base + "/api/health")[0] == 200: break
+        time.sleep(0.5)
+    st, body = http(C["prod_url"] + "/api/state")
+    s = json.loads(body)
+    p = {"focus": ({k: s["focus"][k] for k in "title reason project task priority deadline basis".split() if k in s["focus"]} if s.get("focus") else None)}
+    for sec, keys in STATE_KEYS.items():          # replay order matters: threads first (others reference them)
+        p[sec] = [dict({"id": x["id"]}, **{k: x[k] for k in keys.split() if k in x}) for x in s.get(sec, [])]
+    for it in p.get("inbox", []):                 # the server (rightly) stops Muse from replaying a human's answer to a sensitive item
+        if it.get("sensitive"): it.pop("status", None); it.pop("choice", None)
+    p["journal"] = [{k: j[k] for k in ("message", "kind", "title", "area", "thread") if k in j} for j in reversed(s["journal"])]
+    st, body = http(base + "/api/update", "POST", json.dumps(p).encode(), {"Authorization": "Bearer " + token, "Content-Type": "application/json"})
+    log("preview seeded with a COPY of live content (status %s). Read-only; prod data untouched." % st)
+    for b in C.get("preview_binds", ["127.0.0.1"]): log("preview: http://%s:%d/" % (b, port))
+    log("(re-run --preview after edits to refresh; --preview-stop to remove; preview shows workspace as-is, NOT validated)")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="muse-ui-deploy")
+    g = ap.add_mutually_exclusive_group()
+    for f in ("check", "preview", "preview-stop", "status", "report", "init"): g.add_argument("--" + f, action="store_true")
+    g.add_argument("--rollback", nargs="?", const="", metavar="RELEASE_ID")
+    ap.add_argument("--simulate-post-failure", action="store_true", help=argparse.SUPPRESS)
+    a = ap.parse_args()
+    if a.simulate_post_failure and (os.geteuid() == 0 or os.environ.get("MUSE_UI_DEV") != "1" or os.environ.get("SUDO_USER")):
+        log("--simulate-post-failure is only available to the administrator in dev mode"); return 64
+    os.umask(0o022)
+    for d in (REL, REP, STG, LIVE): os.makedirs(d, exist_ok=True)
+    lockf = open(os.path.join(STG, ".lock"), "w")
+    try: fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError: log("another muse-ui-deploy run is in progress"); return 75
+    if a.status: return cmd_status()
+    if a.report: return cmd_report()
+    if a.init: return cmd_init()
+    if a.preview or a.preview_stop: return cmd_preview(a.preview_stop)
+    if a.rollback is not None: return cmd_rollback(a.rollback)
+    return cmd_deploy(a.check, a.simulate_post_failure)
+
+
+if __name__ == "__main__":
+    try: sys.exit(main())
+    except subprocess.TimeoutExpired as e:
+        log("timeout: %s" % e.cmd[:3]); sys.exit(6)
