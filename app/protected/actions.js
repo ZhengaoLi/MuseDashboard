@@ -105,7 +105,7 @@
       .then(function (res) {
         free();
         if (res.status === 200) {
-          if (body.type === "ui_action") toast(res.json.duplicate ? "已提交过 · 等待 Muse 处理" : "已提交 · 等待 Muse 处理");
+          if (body.type === "ui_action") toast(res.json.duplicate ? "Already submitted · waiting for Muse" : "Submitted · waiting for Muse");
           else toast({ not_attending: "Marked as not attending", attend: "Attending again", stop_reminding: "Stop requested — waiting for Muse to confirm", resume_reminding: "Request sent — waiting for Muse to confirm" }[body.type] || "Done");
           window.dispatchEvent(new CustomEvent("muse:refresh", { detail: { action: res.json.action } })); return;
         }
@@ -114,10 +114,10 @@
         if (res.status === 409 && res.json && res.json.error && res.json.error.code === "open_work") {
           var det = (res.json.error.details || [])[0] || {}; archiveDialog("This thread", det.impact || {}, body, el); return;
         }
-        if (res.status === 410) { toast("此操作已过期，没有提交", true); window.dispatchEvent(new CustomEvent("muse:refresh")); return; }
-        if (res.json && res.json.error && res.json.error.code === "unknown_action") { toast("此操作已被撤回，没有提交", true); window.dispatchEvent(new CustomEvent("muse:refresh")); return; }
+        if (res.status === 410) { toast("This action has expired; nothing was submitted", true); window.dispatchEvent(new CustomEvent("muse:refresh")); return; }
+        if (res.json && res.json.error && res.json.error.code === "unknown_action") { toast("This action was withdrawn; nothing was submitted", true); window.dispatchEvent(new CustomEvent("muse:refresh")); return; }
         toast((res.json && res.json.error && res.json.error.message) || "Action failed", true);
-      }).catch(function () { free(); toast("网络错误，没有提交", true); });
+      }).catch(function () { free(); toast("Network error; nothing was submitted", true); });
   }
 
   function run(d, el) {
@@ -136,7 +136,7 @@
       var needs = !!rec.sensitive, ua = null;
       if (d.act === "ui_action") {
         ua = (rec.ui_actions || []).filter(function (u) { return u.id === d.ua; })[0];
-        if (!ua) { toast("此操作已被撤回，没有提交", true); window.dispatchEvent(new CustomEvent("muse:refresh")); return; }
+        if (!ua) { toast("This action was withdrawn; nothing was submitted", true); window.dispatchEvent(new CustomEvent("muse:refresh")); return; }
         needs = !!ua.sensitive;
       }
       if (!needs && d.section === "threads" && d.act === "done") {
@@ -165,7 +165,7 @@
       nodes.push(el_("div", "ma-warn", "Sensitive item. Muse can only ask; this click is your own explicit answer. Muse will not act on money or account security by itself."));
       dialog(((ua && ua.label) || LABEL[d.act] || d.act) + "?", nodes, [
         { label: "Cancel" },
-        { label: (ua && "确认") || LABEL[d.act] || "Confirm", primary: true, run: function () { body.sensitive_ack = true; send(body, el); } }
+        { label: (ua && "Confirm") || LABEL[d.act] || "Confirm", primary: true, run: function () { body.sensitive_ack = true; send(body, el); } }
       ]);
     });
   }

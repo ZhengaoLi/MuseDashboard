@@ -33,7 +33,7 @@ def act(c, body, headers=None):
 
 RIDE = {"id": "book_ride", "label": "Book a test ride", "intent": "schedule_ride",
        "steps": [{"id": "slot", "prompt": "When?", "choices": [{"value": "am", "label": "Morning"}, {"value": "pm", "label": "Afternoon"}]}]}
-SINGLE = {"id": "nudge", "label": "提醒我跟进", "intent": "remind_followup"}
+SINGLE = {"id": "nudge", "label": "Remind me to follow up", "intent": "remind_followup"}
 
 
 def seed(c, ui=None):
@@ -170,9 +170,9 @@ def test_consumption_lifecycle(c):
     pub(c, {"actions_seen": aid})
     assert st()["status"] == "seen"
     assert pub(c, {"action_results": [{"id": 999, "status": "completed"}]}).status_code == 422
-    r = pub(c, {"action_results": [{"id": aid, "status": "completed", "note": "已约上周三上午"}]})
+    r = pub(c, {"action_results": [{"id": aid, "status": "completed", "note": "Booked last Wednesday morning"}]})
     assert r.status_code == 200 and r.json()["results_recorded"] == 1
-    assert st()["status"] == "completed" and st()["note"] == "已约上周三上午"
+    assert st()["status"] == "completed" and st()["note"] == "Booked last Wednesday morning"
     r = pub(c, {"action_results": [{"id": aid, "status": "declined", "note": "late"}]})      # first result wins
     assert r.json().get("results_recorded", 0) == 0 and st()["status"] == "completed"
     assert pub(c, {"action_results": [{"id": aid, "status": "bogus"}]}).status_code == 422

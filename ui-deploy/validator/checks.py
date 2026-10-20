@@ -369,25 +369,25 @@ def ui_action_checks(browser, base, mtoken, htoken):
     n0 = len(posts)
     pg.click(card + " button[data-ui=ua-start]"); pg.wait_for_selector(card + " button[data-ui=ua-pick]")
     rec("ui_actions: multi-step choice stays local (nothing sent after start)", len(posts) == n0)
-    pg.click(card + " button[data-ui=ua-pick]:has-text('Fixture morning')"); pg.wait_for_selector(card + " button[data-act=ui_action]:has-text('确认')")
+    pg.click(card + " button[data-ui=ua-pick]:has-text('Fixture morning')"); pg.wait_for_selector(card + " button[data-act=ui_action]:has-text('Confirm')")
     rec("ui_actions: reaches confirm step locally, still nothing sent", len(posts) == n0 and "Fixture morning" in pg.inner_text(card))
     pg.click(card + " button[data-ui=ua-back]"); pg.wait_for_selector(card + " button[data-ui=ua-pick]")
-    pg.click(card + " button[data-ui=ua-pick]:has-text('Fixture afternoon')"); pg.wait_for_selector(card + " button[data-act=ui_action]:has-text('确认')")
+    pg.click(card + " button[data-ui=ua-pick]:has-text('Fixture afternoon')"); pg.wait_for_selector(card + " button[data-act=ui_action]:has-text('Confirm')")
     with pg.expect_response(lambda r: r.url.endswith("/api/action")) as ri:
-        pg.dblclick(card + " button[data-act=ui_action]:has-text('确认')")
+        pg.dblclick(card + " button[data-act=ui_action]:has-text('Confirm')")
     pg.wait_for_timeout(1500)
     acts = actions_for(base, "fxid-th-3")
     rec("ui_actions: single structured submit accepted by backend", ri.value.status == 200 and len(acts) == 1 and acts[0]["params"]["intent"] == "schedule_fixture"
         and acts[0]["params"]["selection"] == {"slot": "pm"}, acts)
     rec("ui_actions: double click creates one action only", len(acts) == 1)
     card = thread_card(pg, "Fixture thread 3")
-    rec("ui_actions: immediate 'accepted' status shown (waiting for Muse)", "已提交 · 等待 Muse 处理" in pg.inner_text(card))
-    rec("ui_actions: action does not leak to other threads", not actions_for(base, "fxid-th-1") and "已提交" not in pg.inner_text("#matters details#thread-fxid-th-1"))
+    rec("ui_actions: immediate 'accepted' status shown (waiting for Muse)", "Submitted · waiting for Muse" in pg.inner_text(card))
+    rec("ui_actions: action does not leak to other threads", not actions_for(base, "fxid-th-1") and "Submitted" not in pg.inner_text("#matters details#thread-fxid-th-1"))
     aid = acts[0]["id"]
     call(base, "/api/update", "POST", {"actions_seen": aid}, mtoken); pg.wait_for_timeout(6500)
-    rec("ui_actions: 'Muse read it' status shown", "Muse 已读取" in pg.inner_text(thread_card(pg, "Fixture thread 3")))
+    rec("ui_actions: 'Muse read it' status shown", "Muse has read it" in pg.inner_text(thread_card(pg, "Fixture thread 3")))
     call(base, "/api/update", "POST", {"action_results": [{"id": aid, "status": "completed", "note": "Fixture booked"}]}, mtoken); pg.wait_for_timeout(6500)
-    rec("ui_actions: completion shown only after Muse reports it", "✓ 已完成：Fixture booked" in pg.inner_text(thread_card(pg, "Fixture thread 3")))
+    rec("ui_actions: completion shown only after Muse reports it", "✓ Done: Fixture booked" in pg.inner_text(thread_card(pg, "Fixture thread 3")))
     # sensitive declared action -> protected dialog, nothing sent before confirmation
     card = thread_card(pg, "Fixture thread 3"); n1 = len(posts)
     pg.click(card + " button[data-act=ui_action]:has-text('Fixture risky ask')"); pg.wait_for_selector("#muse-actions-root [role=dialog]", timeout=4000)
@@ -397,7 +397,7 @@ def ui_action_checks(browser, base, mtoken, htoken):
     # network failure must be explicit, never fake success
     pg.route("**/api/action", lambda r: r.abort())
     pg.click(card + " button[data-act=ui_action]:has-text('Fixture nudge me')"); pg.wait_for_timeout(1500)
-    rec("ui_actions: network failure is reported and no pending state is faked", pg.is_visible("#muse-actions-root .ma-toast.bad") and "网络错误" in pg.inner_text("#muse-actions-root")
+    rec("ui_actions: network failure is reported and no pending state is faked", pg.is_visible("#muse-actions-root .ma-toast.bad") and "Network error" in pg.inner_text("#muse-actions-root")
         and not [a for a in actions_for(base, "fxid-th-3") if a["params"].get("intent") == "nudge_fixture"])
     pg.unroute("**/api/action")
     # Muse withdraws the declarations: they disappear and cannot be submitted

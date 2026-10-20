@@ -54,8 +54,8 @@
   function ago(ts) { return dur((Date.parse(S.server_time) - Date.parse(ts)) / 1000) + " ago"; }
   function line(note) {
     if (!note) return "";
-    var seg = note.split(/[；;。\n]/).map(function (x) { return x.trim(); }).filter(Boolean);
-    if (!seg.length) return ""; var out = seg[0]; if (out.length < 14 && seg[1]) out += "；" + seg[1]; return out;
+    var seg = note.split(/[\uff1b;\u3002\n]/).map(function (x) { return x.trim(); }).filter(Boolean);
+    if (!seg.length) return ""; var out = seg[0]; if (out.length < 14 && seg[1]) out += "; " + seg[1]; return out;
   }
 
   // ---------- data helpers ----------
@@ -393,7 +393,7 @@
       var key = t.id + "|" + u.id, a = latestAct(t.id, u.id), row = h("div", "ua-row"), st = UA[key], steps = u.steps || [];
       if (a && (a.status === "accepted" || a.status === "seen")) {          // Accepted: stored by the backend, waiting for Muse
         delete UA[key];
-        add(row, h("div", "t", u.label), h("div", "tag amber", "已提交 · " + (a.status === "seen" ? "Muse 已读取，处理中" : "等待 Muse 处理") + (uaPicked(a) ? " · " + uaPicked(a) : "")));
+        add(row, h("div", "t", u.label), h("div", "tag amber", "Submitted · " + (a.status === "seen" ? "Muse has read it, working on it" : "waiting for Muse") + (uaPicked(a) ? " · " + uaPicked(a) : "")));
       } else if (!steps.length) {
         add(row, uaButton(u.label, { "data-act": "ui_action", "data-section": "threads", "data-id": t.id, "data-ua": u.id, "data-selection": "{}" }, u.sensitive ? "warn" : ""));
       } else if (!st) {
@@ -403,16 +403,16 @@
         add(row, h("div", "t", u.label + "  " + (st.step + 1) + "/" + (steps.length + 1)), h("div", "s", s0.prompt));
         var bs = h("div", "btns");
         s0.choices.forEach(function (c) { add(bs, uaButton(c.label, { "data-ui": "ua-pick", "data-thread": t.id, "data-ua": u.id, "data-value": c.value })); });
-        add(bs, uaButton("取消", { "data-ui": "ua-cancel", "data-thread": t.id, "data-ua": u.id })); row.appendChild(bs);
+        add(bs, uaButton("Cancel", { "data-ui": "ua-cancel", "data-thread": t.id, "data-ua": u.id })); row.appendChild(bs);
       } else {                                                                // final local step: confirm
         var picked = steps.map(function (sp) { var c = sp.choices.filter(function (x) { return x.value === st.sel[sp.id]; })[0]; return c ? c.label : ""; }).join(" · ");
-        add(row, h("div", "t", u.label + "  " + (steps.length + 1) + "/" + (steps.length + 1)), h("div", "s", "确认提交：" + picked));
+        add(row, h("div", "t", u.label + "  " + (steps.length + 1) + "/" + (steps.length + 1)), h("div", "s", "Confirm submission: " + picked));
         var bs2 = h("div", "btns");
-        add(bs2, uaButton("确认", { "data-act": "ui_action", "data-section": "threads", "data-id": t.id, "data-ua": u.id, "data-selection": JSON.stringify(st.sel) }, "primary"),
-            uaButton("返回", { "data-ui": "ua-back", "data-thread": t.id, "data-ua": u.id }), uaButton("取消", { "data-ui": "ua-cancel", "data-thread": t.id, "data-ua": u.id })); row.appendChild(bs2);
+        add(bs2, uaButton("Confirm", { "data-act": "ui_action", "data-section": "threads", "data-id": t.id, "data-ua": u.id, "data-selection": JSON.stringify(st.sel) }, "primary"),
+            uaButton("Back", { "data-ui": "ua-back", "data-thread": t.id, "data-ua": u.id }), uaButton("Cancel", { "data-ui": "ua-cancel", "data-thread": t.id, "data-ua": u.id })); row.appendChild(bs2);
       }
       if (a && a.status !== "accepted" && a.status !== "seen" && a.result_at && (Date.parse(S.server_time) - Date.parse(a.result_at)) < DAY * 1000) {   // Completed
-        add(row, h("div", "tag " + (a.status === "completed" ? "green" : "amber"), (a.status === "completed" ? "✓ 已完成" : a.status === "declined" ? "Muse 已拒绝" : "Muse 无法完成") + (a.note ? "：" + a.note : "")));
+        add(row, h("div", "tag " + (a.status === "completed" ? "green" : "amber"), (a.status === "completed" ? "✓ Done" : a.status === "declined" ? "Muse declined" : "Muse could not complete") + (a.note ? ": " + a.note : "")));
       }
       box.appendChild(row);
     });
@@ -446,7 +446,7 @@
     if (closed(t) && imp.tasks - imp.waiting > 0) add(tags, chip((imp.tasks - imp.waiting) + " open", "amber"));
     else if (closed(t) && imp.waiting) add(tags, chip("tracking " + imp.waiting));
     var nUa = actionsOn() ? (t.ui_actions || []).filter(function (u) { return !u.expired; }).length : 0;
-    if (nUa) add(tags, chip("● " + nUa + " 可操作", "amber"));
+    if (nUa) add(tags, chip("● " + nUa + " actionable", "amber"));
     add(top, left, nx ? chip(fmtTs(nx.ts, nx.dateOnly), "") : tags);
     add(sm, top, (t.summary || t.next_step) ? h("div", "thr-sum", line(t.summary || t.next_step)) : null);
     if (nx && (t.stage || t.status !== "active")) top.appendChild(tags);
@@ -585,7 +585,7 @@
   }
 
   // ---------- LOG ----------
-  function sentence(msg) { var m = /^(.{8,140}?[。！？.!?；;：:])\s*/.exec(msg); return m ? m[1] : (msg.length > 120 ? msg.slice(0, 117) + "…" : msg); }
+  function sentence(msg) { var m = /^(.{8,140}?[\u3002\uff01\uff1f.!?\uff1b;\uff1a:])\s*/.exec(msg); return m ? m[1] : (msg.length > 120 ? msg.slice(0, 117) + "…" : msg); }
   function renderLog() {
     var b = body("log");
     var tabs = h("div", "tabs");
