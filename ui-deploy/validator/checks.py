@@ -4,7 +4,7 @@ import argparse, json, os, re, sys, time, urllib.request, urllib.error
 from datetime import datetime, timedelta, timezone
 from playwright.sync_api import sync_playwright
 
-VIEWS = {"home": ["focus", "needs-you", "upcoming", "in-progress", "matters"], "week": ["week-grid"], "timeline": ["timeline-full"], "log": ["log"], "system": ["routines", "system-status"]}
+VIEWS = {"home": ["focus", "needs-you", "upcoming", "in-progress", "matters"], "week": ["week-grid"], "timeline": ["timeline-full"], "papers": ["papers"], "log": ["log"], "system": ["routines", "system-status"]}
 OPTIONAL = {"needs-you", "upcoming", "in-progress"}          # hidden (not empty placeholders) when they have nothing to show
 ALL_SECTIONS = [s for v in VIEWS.values() for s in v]
 VIEWPORTS = {"desktop": (1280, 800), "mobile": (390, 844)}
@@ -103,6 +103,28 @@ def fixture(today):
         {"id": "fxid-q-arch2", "title": "Fixture archived active task", "status": "active", "thread": "fxid-th-8"},
         {"id": "fxid-q-rec", "title": "Fixture recommended work", "status": "active", "thread": "fxid-th-3", "order": 0, "priority": "p0"},
         {"id": "fxid-q-recdup", "title": "Fixture recommended work copy", "status": "active", "thread": "fxid-th-1", "order": 0, "priority": "p0"}]
+    f["inbox"] += [{"id": "fxid-in-ns", "title": "Fixture long ask without status", "kind": "decision",
+                    "options": ["Fixture long option text that has to wrap on a phone screen", "Fixture short option"],
+                    "detail": "Fixture sentence one is short. " + "Filler words that make the explanation long enough to need folding. " * 8 + "END-MARK-NEEDS"}]
+    f["inbox"][-1].pop("status", None)
+    f["threads"] += [{"id": "zz-fixture-hidden", "title": "Fixture hidden test thread", "area": "life", "status": "active"},
+                     {"id": "fxid-th-9", "title": "Fixture long summary thread", "area": "life", "status": "active",
+                      "summary": "Fixture intro sentence for a long plan.\n\n" + "\n\n".join("Fixture day %d: South | %s. McMahon | %s." % (i, "lorem ipsum dolor sit amet " * 4, "consectetur adipiscing elit " * 4) for i in range(1, 6)) + "\n\nFIXTURE-END-MARK"}]
+    f["threads"][5]["stage"] = "unknown"
+    f["deadlines"] += [{"id": "fxid-d-soon", "title": "Fixture formal deadline soon", "due": iso(days=5), "status": "open", "thread": "fxid-th-2"}]
+    f["schedule"] += [{"id": "fxid-s-habit%d" % i, "title": "Fixture daily habit", "start": iso(days=i, hours=1), "status": "confirmed"} for i in range(1, 6)]
+    yd = (datetime.fromisoformat(today) - timedelta(days=1)).strftime("%Y-%m-%d"); d3 = (datetime.fromisoformat(today) - timedelta(days=3)).strftime("%Y-%m-%d")
+    qs = "Fixture quote sentence really is in the abstract."
+    def pap(n, day, rank, **kw):
+        d = {"id": "fxp%d" % n, "kind": "paper", "title": "Fixture paper %d about balancing adapters across tasks" % n, "arxiv_id": "2610.%05d" % (700 + n), "rec_date": day, "rank": rank,
+             "authors": ["Fixture Author %d" % k for k in range(1, 5)], "published": day, "abstract": "Fixture abstract for paper %d. %s Another sentence follows here." % (n, qs),
+             "reason": "Fixture reason %d: matches the fixture thread." % n, "projects": ["fxid-th-1", "no-such-project"],
+             "sources": [{"name": "arxiv", "url": "https://arxiv.org/abs/2610.%05d" % (700 + n)}, {"name": "huggingface", "url": "https://huggingface.co/papers/2610.%05d" % (700 + n)}]}
+        d.update(kw); return d
+    f["papers"] = [pap(1, today, 1, quote=qs, reason='<img src=x onerror="window.__xss=3"> Fixture hostile reason', sources=[{"name": "arxiv", "url": "https://arxiv.org/abs/2610.00701"}, {"name": "huggingface", "url": "https://huggingface.co/papers/2610.00701"}, {"name": "scholar", "url": "https://scholar.google.com/scholar?q=fixture"}]),
+                   pap(2, today, 2, quote="This quote is not in the abstract."), pap(3, today, 3, title="Fixture paper 3 " + "with a very long title that must wrap on a narrow phone screen " * 3),
+                   pap(4, today, 4), pap(5, today, 5), pap(6, yd, 1), pap(7, yd, 2),
+                   {"id": "dm", "kind": "day", "rec_date": d3, "title": "No recommendation", "candidates": 48, "note": "Fixture empty day: nothing matched closely."}]
     f["schedule"] += [
         {"id": "fxid-s-neg", "title": "Fixture neg event", "start": iso(minutes=20), "status": "confirmed", "thread": "fxid-th-3"},
         {"id": "fxid-s-tz1", "title": "Fixture tz offset EDT", "start": "2030-10-19T08:30:00-04:00", "status": "confirmed"},
@@ -160,7 +182,7 @@ JS_STATS = """(secs) => {
   const root = '#muse-actions-root';
   out.forbidden = [...document.querySelectorAll('form,input,textarea,select,iframe,object,embed,[contenteditable]')].filter(e => !e.closest(root)).length;
   out.badButtons = [...document.querySelectorAll('button')].filter(b => !b.closest(root) && !b.hasAttribute('data-act') && !b.hasAttribute('data-ui') && b.id !== 'theme-toggle').length;
-  out.extlinks = [...document.querySelectorAll('a[href]')].filter(a => !a.href.startsWith(location.origin)).length;
+  out.extlinks = [...document.querySelectorAll('a[href]')].filter(a => !a.href.startsWith(location.origin) && !a.closest('#papers')).length;      // only the Papers page may link out (checked separately)
   out.body = document.body.innerText;
   let min = 99; const w = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
   while (w.nextNode()) { const n = w.currentNode; if (!n.textContent.trim()) continue; const el = n.parentElement; if (el.closest('[hidden]')) continue;
@@ -202,8 +224,23 @@ def assess(vp, pg, st, label, view, fx=None, outdir=None):
         rec("%s: no raw ENUM labels" % tag, not raw, raw[:5])
         if view == "home":
             sec = s["sections"]
-            rec("%s: headings use the new names (MUSE RECOMMENDS, UPCOMING, IN PROGRESS, ALL MATTERS)" % tag,
-                all(sec[k]["heading"].strip() == v for k, v in (("focus", "MUSE RECOMMENDS"), ("upcoming", "UPCOMING"), ("in-progress", "IN PROGRESS"), ("matters", "ALL MATTERS"))), {k: sec[k]["heading"] for k in sec})
+            rec("%s: headings use the new names (MUSE RECOMMENDS, UPCOMING, MUSE IS TRACKING, ALL MATTERS)" % tag,
+                all(sec[k]["heading"].strip() == v for k, v in (("focus", "MUSE RECOMMENDS"), ("upcoming", "UPCOMING"), ("in-progress", "MUSE IS TRACKING"), ("matters", "ALL MATTERS"))), {k: sec[k]["heading"] for k in sec})
+            full_needs = pg.evaluate("document.querySelector('#needs-you').textContent")
+            ask = pg.evaluate("(() => { const a=[...document.querySelectorAll('#needs-you .ask')].find(x=>x.innerText.includes('Fixture long ask without status')); if(!a) return null; const bs=[...a.querySelectorAll('button[data-act]')].map(b=>{const r=b.getBoundingClientRect(); return {t:b.innerText, w:r.width, right:r.right, h:r.height}}); return {bs, det: !!a.querySelector('details.more'), vw: document.documentElement.clientWidth}; })()")
+            rec("%s: Needs You shows an item without a status, with its action buttons" % tag, bool(ask) and len(ask["bs"]) == 2, ask)
+            rec("%s: Needs You: the whole message is reachable (folded behind Show details, never cut off)" % tag, bool(ask) and ask["det"] and "END-MARK-NEEDS" in full_needs and pg.evaluate("[...document.querySelectorAll('#needs-you .s')].every(e => getComputedStyle(e).webkitLineClamp === 'none')"), full_needs[-120:])
+            rec("%s: Needs You buttons fit the screen and are comfortable to tap" % tag, bool(ask) and all(b["right"] <= ask["vw"] and b["h"] >= (40 if vp == "mobile" else 28) for b in ask["bs"]), ask)
+            upv = pg.evaluate("[...document.querySelectorAll('#upcoming .body > .card-row, #upcoming .body > .day')].map(e => e.innerText).join('\\n')")
+            hab = pg.evaluate("(() => { const d = document.querySelector('#upcoming details.more'); return d ? {sum: d.querySelector('summary').innerText, open: d.open, n: d.querySelectorAll('.card-row').length} : null; })()")
+            ndl = pg.evaluate("[...document.querySelectorAll('#upcoming .body > .card-row .chip2')].filter(e => e.textContent === 'Deadline').length")
+            rec("%s: formal deadlines keep a guaranteed place on Home even when events and routines are many" % tag, ndl >= 3, ndl)
+            rec("%s: repeating routines are folded (not in the main rows) yet still counted and reachable" % tag, "Fixture daily habit" not in upv and bool(hab) and not hab["open"] and "Daily routines" in hab["sum"] and hab["n"] >= 4, hab)
+            wk = pg.evaluate("document.querySelector('#timeline-full') && 1")
+            trk = pg.evaluate("(() => { const r=[...document.querySelectorAll('#in-progress .trk')]; return {rows: r.length, text: document.querySelector('#in-progress').textContent, more: !!document.querySelector('#in-progress details.more')}; })()")
+            rec("%s: Muse Is Tracking shows waiting work as a few real rows with progress/next step, not 'Waiting (N)'" % tag, 1 <= trk["rows"] <= 3 and "Waiting (" not in trk["text"] and ("Next:" in trk["text"] or "Supporting note" in trk["text"]), trk)
+            rec("%s: hidden test/debug records stay out of the daily views" % tag, "Fixture hidden test thread" not in pg.evaluate("document.querySelector('#matters').textContent"))
+            rec("%s: technical words are gone from Home counts and buttons (no 'thread(s)')" % tag, not re.search(r"thread", " ".join(pg.evaluate("[...document.querySelectorAll('#matters summary .n, #matters .btn, #matters summary')].filter(e => !e.closest('details.thread') || e.matches('summary .n')).map(e => e.matches('summary') && e.closest('details.thread') ? '' : e.textContent)")), re.I))
             rec("%s: misleading titles are gone (MUSE IS ON IT / CURRENT FOCUS / TODAY'S PLAN / COMING UP)" % tag, not any(x in body for x in ("MUSE IS ON IT", "CURRENT FOCUS", "TODAY'S PLAN", "COMING UP")))
             rec("%s: recommendation shows its linked thread's next step and an Open button" % tag, "Fixture next step" in sec["focus"]["text"] and pg.is_visible("#focus button[data-ui=open-thread]"), sec["focus"]["text"][:160])
             rec("%s: focus visible above the fold" % tag, sec["focus"]["top"] < VIEWPORTS[vp][1] * 0.6)
@@ -213,7 +250,7 @@ def assess(vp, pg, st, label, view, fx=None, outdir=None):
                 rec("%s: %s first-screen shows <= %d items" % (tag, k, lim), n_shown <= lim, "shows %d" % n_shown)
             rec("%s: sensitive ask is flagged" % tag, "Sensitive" in sec["needs-you"]["text"])
             up = sec["upcoming"]["text"]
-            rec("%s: upcoming shows today's plan (any status) together with the coming days, <= 8 rows" % tag, "Fixture plan tonight todo" in up and "Fixture plan morning active" in up and s["tlRows"] <= 8, s["tlRows"])
+            rec("%s: upcoming shows today's plan (any status) together with the coming days, <= 8 rows" % tag, "Fixture plan tonight todo" in up and "Fixture plan morning active" in up and pg.evaluate("document.querySelectorAll('#upcoming .body > .card-row').length") <= 8, s["tlRows"])
             rec("%s: upcoming excludes tomorrow-only noise of done/missed/unplanned items" % tag, not any(x in up for x in ("Fixture plan done", "Fixture plan missed", "Fixture high priority unplanned")))
             rec("%s: missed plans are kept in a collapsed list, not lost" % tag, "Missed plans" in up)
             lists = up + sec["in-progress"]["text"] + sec["needs-you"]["text"]
@@ -257,7 +294,14 @@ def assess(vp, pg, st, label, view, fx=None, outdir=None):
             tdy = call(base_url(), "/api/state")[1]["today"]
             dates = [d["date"] for d in wk]
             rec("%s: seven day columns starting today, consecutive, today highlighted" % tag, len(wk) == 7 and dates[0] == tdy and wk[0]["today"] and all((datetime.fromisoformat(dates[i + 1]) - datetime.fromisoformat(dates[i])).days == 1 for i in range(6)), dates)
-            rec("%s: no clock times are shown in the 7-day view" % tag, not re.search(r"\d{1,2}:\d{2}", s["sections"]["week-grid"]["text"]), s["sections"]["week-grid"]["text"][:160])
+            # clock times are optional: an item that has a real time shows it (in Eastern Time); date-only plans never get an invented one
+            wi = pg.evaluate("[...document.querySelectorAll('#week-grid .wk-item')].map(e => ({k: e.className, t: (e.querySelector('.wk-time')||{}).innerText||'', x: e.innerText}))")
+            clk = re.compile(r"\d{1,2}:\d{2}")
+            rec("%s: items with a real time show it in the 7-day view" % tag, any(clk.search(i["t"]) for i in wi if " event" in " " + i["k"]), [i["t"] for i in wi][:12])
+            rec("%s: date-only planned tasks show no invented clock time in the 7-day view" % tag, any(" plan" in " " + i["k"] for i in wi) and not any(clk.search(i["t"]) for i in wi if " plan" in " " + i["k"]), [i["t"] for i in wi if " plan" in " " + i["k"]])
+            wtz = {"Fixture tz offset EDT": "8:30 AM", "Fixture tz naive EDT": "2:30 PM", "Fixture tz offset EST": "10:00 AM", "Fixture AoE deadline": "7:59 AM"}
+            wbad = {k: v for k in wtz for v in [[i["x"] for i in wi if k in i["x"]]] if v and wtz[k] not in v[0]}
+            rec("%s: clock times in the 7-day view are Eastern Time even though this browser runs in UTC" % tag, not wbad, wbad)
             allst = call(base_url(), "/api/state")[1]
             wrong = []
             for e in allst["schedule"]:
@@ -277,7 +321,12 @@ def assess(vp, pg, st, label, view, fx=None, outdir=None):
             n = pg.evaluate("document.querySelectorAll('#log .entry').length")
             rec("%s: log default page <= 10 entries" % tag, n <= 10, n)
         if view == "system":
-            rec("%s: routines grouped by cadence/time of day" % tag, all(x in body.lower() for x in ("always on", "weekly")) and "fixture once reminder" not in body.lower())
+            chips = pg.evaluate("[...document.querySelectorAll('#view-system .tag')].filter(e => e.textContent.trim() === 'Unknown').map(e => e.className)")
+            rec("%s: an unknown status is shown as Unknown and never in green" % tag, bool(chips) and not any("green" in c for c in chips), chips)
+            tdbg = pg.evaluate("[...document.querySelectorAll('#view-system details.more > summary')].map(e => e.textContent.trim())")
+            rec("%s: System keeps test/debug items searchable, folded, and shows a plain status first" % tag, any(x.startswith("Test & debug items") for x in tdbg) and "reporting normally" in pg.evaluate("document.querySelector('#system-status').innerText"), tdbg)
+            full = pg.evaluate("document.body.textContent").lower()          # the list is folded by default; its content must still be there
+            rec("%s: routines grouped by cadence/time of day (folded by default)" % tag, all(x in full for x in ("always on", "weekly")) and "fixture once reminder" not in full and pg.evaluate("!document.querySelector('#routines details.more').open"))
     return s
 
 
@@ -444,7 +493,7 @@ def context_checks(browser, base, mtoken, ctoken, htoken):
     rec("context: valid fresh event accepted", r[0] == 200 and r[1].get("stored"), r)
     pg.wait_for_timeout(6500)
     txt = pg.inner_text(sel) if pg.is_visible(sel) else ""
-    rec("context: fresh event shown with source, action and time", "Phone detected" in txt and "entered Home geofence" in txt and re.search(r"\d{1,2}:\d{2}", txt), txt)
+    rec("context: fresh event shown with source, action and time", "Chronicle detected" in txt and "entered Home geofence" in txt and re.search(r"\d{1,2}:\d{2}", txt), txt)
     rec("context: wording never claims the user is currently there", not re.search(r"(you are|you're|currently|now at|is home|at home)", txt, re.I), txt)
     ctx_post(base, ctoken, "left_home", 30)                                       # arrives late, happened earlier
     pg.wait_for_timeout(6500)
@@ -474,6 +523,105 @@ def open_sec(pg, card):
     pg.wait_for_selector(card + " details.sec[open] button", timeout=3000)
 
 
+def papers_checks(browser, base, mtoken, htoken):
+    st0 = call(base, "/api/state")[1]; nq = len(st0["queue"])
+    for vp in VIEWPORTS:
+        posts = []
+        ctx, pg, st = open_page(browser, vp, base, htoken, posts)
+        go(pg, "papers"); pg.wait_for_selector("#papers .paper", timeout=8000); pg.wait_for_timeout(500)
+        tag = "papers/%s" % vp
+        rec("%s: Today shows the 5 picks, 4 filter tabs, no overflow" % tag, pg.locator("#papers .paper").count() == 5 and pg.locator("#papers button[data-ui=pap-tab]").count() == 4 and not pg.evaluate("document.documentElement.scrollWidth > document.documentElement.clientWidth + 1"))
+        rec("%s: hostile text is rendered literally, nothing executed" % tag, "<img src=x" in pg.inner_text("#papers") and pg.evaluate("window.__xss === undefined"))
+        links = pg.evaluate("[...document.querySelectorAll('#papers a[href]')].map(a => [a.href, a.rel, a.target])")
+        okhost = lambda u: re.match(r"^https://(arxiv\.org|huggingface\.co|scholar\.google\.com)/", u) is not None
+        rec("%s: every outbound link is https, on a paper host, noopener, new tab" % tag, links and all(okhost(u) and "noopener" in r and t == "_blank" for u, r, t in links), links[:3])
+        card1 = pg.locator("#papers .paper").nth(0)
+        t1 = card1.inner_text()
+        rec("%s: card shows title, authors, date, reason, verified quote, project, abstract, 3 sources" % tag,
+            "Fixture paper 1" in t1 and "Fixture Author 1" in t1 and "+1" in t1 and "Published" in t1 and "Muse's reason:" in t1 and "Fixture quote sentence really is in the abstract." in t1 and "Matches: Fixture thread 1" in t1
+            and "no-such-project" not in t1 and card1.locator(".psrc a").count() == 3 and card1.locator("details.more").count() == 1, t1[:200])
+        c2 = pg.locator("#papers .paper").nth(1).inner_text()
+        rec("%s: an unverifiable quote is flagged and its text is NOT shown as fact" % tag, "Quote not found" in c2 and "This quote is not in the abstract." not in c2, c2[:160])
+        # light feedback: Save -> Save again (undo) -> Not relevant hides -> undo from the hidden list
+        def status_of(pid): return {p["id"]: p["status"] for d in call(base, "/api/papers?days=30")[1]["days"] for p in d["papers"]}[pid]
+        pid = "arxiv:2610.00701"
+        card1.locator("button[data-paper-action=save]").click(); pg.wait_for_timeout(2300)
+        rec("%s: Save is recorded and the button shows pressed" % tag, status_of(pid) == "saved" and pg.locator("#papers .paper").nth(0).locator("button[data-paper-action=save]").get_attribute("aria-pressed") == "true")
+        pg.locator("#papers .paper").nth(0).locator("button[data-paper-action=save]").click(); pg.wait_for_timeout(2300)
+        rec("%s: pressing Save again undoes it" % tag, status_of(pid) == "recommended")
+        pg.locator("#papers .paper").nth(0).locator("button[data-paper-action=not_relevant]").click(); pg.wait_for_timeout(2300)
+        rec("%s: Not relevant hides the card from Today but keeps it undoable" % tag, status_of(pid) == "not_relevant" and pg.locator("#papers .paper:not(.muted)").count() == 4 and "1 hidden as not relevant" in pg.inner_text("#papers"))
+        pg.evaluate("document.querySelector('#papers details[data-key=pap-hidden]').open = true"); pg.wait_for_timeout(200)
+        pg.locator("#papers details[data-key=pap-hidden] button[data-paper-action=not_relevant]").click(); pg.wait_for_timeout(2300)
+        rec("%s: undo from the hidden list restores it" % tag, status_of(pid) == "recommended" and pg.locator("#papers .paper:not(.muted)").count() == 5)
+        pg.locator("#papers .paper").nth(2).locator("button[data-paper-action=read_later]").click(); pg.wait_for_timeout(2300)
+        pg.click("#papers button[data-tab=read_later]"); pg.wait_for_timeout(400)
+        rec("%s: Read later tab lists it" % tag, pg.locator("#papers .paper").count() == 1)
+        pg.click("#papers button[data-tab=history]"); pg.wait_for_timeout(400)
+        days = pg.evaluate("[...document.querySelectorAll('#papers .body > details.more > summary')].map(e => e.textContent.trim())")
+        rec("%s: History groups by day and says honestly when a day had no picks" % tag, len(days) == 3 and any("no picks" in d for d in days) and any("5 picks" in d for d in days) and any("2 picks" in d for d in days), days)
+        pg.evaluate("[...document.querySelectorAll('#papers details.more')].forEach(d => d.open = true)")
+        rec("%s: the empty day shows Muse's note" % tag, "Fixture empty day" in pg.inner_text("#papers"))
+        if vp == "mobile":
+            small = pg.evaluate("[...document.querySelectorAll('#papers button[data-paper-action]')].filter(b => b.getBoundingClientRect().height > 0 && (b.getBoundingClientRect().height < 40 || b.getBoundingClientRect().right > innerWidth)).length")
+            rec("%s: feedback buttons are tappable and fit the phone" % tag, small == 0, small)
+        rec("%s: no JS errors, no bad requests" % tag, not st["errors"] and not st["bad_requests"], "; ".join(st["errors"] + st["bad_requests"])[:200])
+        ctx.close()
+        for p in ("arxiv:2610.00703",): call(base, "/api/action", "POST", {"type": "reopen", "section": "papers", "id": p}, htoken)
+    ctx, pg, st = open_page(browser, "desktop", base, htoken, [])
+    for p in [x["id"] for d in call(base, "/api/papers?days=30")[1]["days"] if d["date"] == st0["today"] for x in d["papers"]]:
+        call(base, "/api/action", "POST", {"type": "not_relevant", "section": "papers", "id": p}, htoken)
+    go(pg, "papers"); pg.wait_for_timeout(2500)
+    rec("papers: when every pick is rated not relevant the page says so instead of staying blank", "Everything from today is hidden" in pg.inner_text("#papers"), pg.inner_text("#papers")[:140])
+    for p in [x["id"] for d in call(base, "/api/papers?days=30")[1]["days"] if d["date"] == st0["today"] for x in d["papers"]]:
+        call(base, "/api/action", "POST", {"type": "reopen", "section": "papers", "id": p}, htoken)
+    ctx.close()
+    rec("papers: rating papers never creates tasks", len(call(base, "/api/state")[1]["queue"]) == nq)
+    code, body = call(base, "/api/action", "POST", {"type": "save", "section": "papers", "id": "arxiv:2610.00701"})
+    rec("papers: rating without the human token is rejected", code == 401, code)
+    code, body = call(base, "/api/update", "POST", {"papers": [{"id": "x", "title": "A long enough title for a link test", "rec_date": st0["today"], "reason": "r", "sources": [{"name": "other", "url": "javascript:alert(1)"}]}]}, mtoken)
+    rec("papers: a javascript: or non-https source is rejected by the server", code == 422, code)
+
+
+def monitor_checks(browser, base):
+    origin = re.match(r"https?://[^/]+", base).group(0)
+    for w, hgt in ((1920, 1080), (1366, 768)):
+        ctx = browser.new_context(viewport={"width": w, "height": hgt}, service_workers="block"); pg = ctx.new_page()
+        errs, methods = [], []
+        pg.on("console", lambda m: errs.append(m.text) if m.type in ("error", "warning") else None)
+        pg.on("pageerror", lambda e: errs.append(str(e)))
+        pg.on("request", lambda r: methods.append((r.method, r.url)) if r.url.startswith(origin) else None)
+        pg.goto(base + "/static/monitor.html", wait_until="load"); pg.wait_for_timeout(2000)
+        tag = "monitor/%dx%d" % (w, hgt)
+        r = pg.evaluate("""() => ({sw: document.documentElement.scrollWidth, sh: document.documentElement.scrollHeight, iw: innerWidth, ih: innerHeight,
+          over: [...document.querySelectorAll('.rows')].filter(e => e.scrollHeight > e.clientHeight + 1).map(e => e.parentElement.id),
+          clock: document.getElementById('clock').textContent, focus: (document.querySelector('#p-focus .ft') || {}).textContent || '',
+          panels: [...document.querySelectorAll('.panel:not([hidden])')].filter(e => !e.querySelector('.rows').textContent.trim()).map(e => e.id),
+          box: (() => { const b = document.getElementById('screen').getBoundingClientRect(); return [Math.round(b.right), Math.round(b.bottom)]; })()})""")
+        rec("%s: fits the screen with no page scrolling" % tag, r["sw"] <= r["iw"] and r["sh"] <= r["ih"] and r["box"][0] <= w + 1 and r["box"][1] <= hgt + 1, r)
+        rec("%s: nothing is cut off inside a panel (overflow becomes '+N more')" % tag, not r["over"], r["over"])
+        rec("%s: shows the clock, the recommendation and non-empty panels" % tag, re.match(r"^\d\d:\d\d$", r["clock"]) is not None and bool(r["focus"]) and not r["panels"], r)
+        rec("%s: read-only, only GET requests, no console errors" % tag, all(m == "GET" for m, _ in methods) and not errs, (methods[:5], errs[:3]))
+        ctx.close()
+
+
+def long_summary_checks(browser, base, htoken):
+    for vp in VIEWPORTS:
+        ctx, pg, st = open_page(browser, vp, base, htoken, [])
+        pg.evaluate("location.hash='#thread=fxid-th-9'"); pg.wait_for_timeout(1500)
+        r = pg.evaluate("""() => { const d = document.getElementById('thread-fxid-th-9'); if (!d) return null; const b = [...d.querySelectorAll(':scope > .s')].find(e => e.textContent.includes('FIXTURE-END-MARK'));
+          const hd = d.querySelector('summary .thr-sum'); const cs = getComputedStyle(b);
+          return {open: d.open, clamp: cs.webkitLineClamp, ws: cs.whiteSpace, h: Math.round(b.getBoundingClientRect().height), sh: b.scrollHeight, lines: Math.round(b.getBoundingClientRect().height / parseFloat(cs.lineHeight)), hdr: hd ? getComputedStyle(hd).display : 'none'}; }""")
+        tag = "long text/%s" % vp
+        rec("%s: a long thread summary is shown in full, not cut to two lines" % tag, bool(r) and r["open"] and r["clamp"] == "none" and r["h"] >= r["sh"] - 2 and r["lines"] > 6, r)
+        rec("%s: line breaks and paragraphs are preserved (pre-line)" % tag, bool(r) and r["ws"] == "pre-line", r)
+        rec("%s: the opened card does not repeat the first sentence in its header" % tag, bool(r) and r["hdr"] == "none", r)
+        pg.evaluate("document.getElementById('thread-fxid-th-9').open = false"); pg.wait_for_timeout(300)
+        rec("%s: the collapsed card still shows a one-line preview" % tag, pg.evaluate("getComputedStyle(document.querySelector('#thread-fxid-th-9 summary .thr-sum')).display") != "none")
+        rec("%s: no horizontal scroll with long text" % tag, not pg.evaluate("document.documentElement.scrollWidth > document.documentElement.clientWidth + 1"))
+        ctx.close()
+
+
 def home_lite_checks(browser, base, mtoken, htoken):
     posts = []
     # --- old links and unknown hashes land on Home
@@ -484,9 +632,9 @@ def home_lite_checks(browser, base, mtoken, htoken):
         rec("compat: old link %s opens Home (no Areas page, no error)" % old, ok and not st["errors"], "; ".join(st["errors"]))
         ctx.close()
     ctx, pg, st = open_page(browser, "desktop", base, htoken, posts)
-    rec("compat: navigation has no separate Areas entry", "Areas" not in pg.inner_text("#nav") and pg.inner_text("#nav").split() == ["Home", "Week", "Timeline", "Log", "System"], pg.inner_text("#nav"))
+    rec("compat: navigation has no separate Areas entry", "Areas" not in pg.inner_text("#nav") and pg.inner_text("#nav").split() == ["Home", "Week", "Timeline", "Papers", "Log", "System"], pg.inner_text("#nav"))
     # --- every non-system thread is reachable from Home
-    api_threads = [t for t in call(base, "/api/state")[1]["threads"] if t.get("area") != "system"]
+    api_threads = [t for t in call(base, "/api/state")[1]["threads"] if t.get("area") != "system" and not t["id"].startswith("zz-")]
     dom = pg.evaluate("[...document.querySelectorAll('#matters details.thread')].map(e => e.id)")
     rec("home: All Matters gives access to every thread", all(("thread-" + t["id"]) in dom for t in api_threads), (len(dom), len(api_threads)))
     # --- locate from the recommendation
@@ -758,6 +906,9 @@ def run(a, base):
             ctx.close()
         interaction_checks(browser, base, a.token, a.human_token, a.out)
         home_lite_checks(browser, base, a.token, a.human_token)
+        papers_checks(browser, base, a.token, a.human_token)
+        long_summary_checks(browser, base, a.human_token)
+        monitor_checks(browser, base)
         week_checks(browser, base)
         negation_checks(browser, base, a.token, a.human_token)
         context_checks(browser, base, a.token, a.chronicle_token, a.human_token)

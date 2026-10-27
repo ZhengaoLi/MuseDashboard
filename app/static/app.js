@@ -54,8 +54,8 @@
   function ago(ts) { return dur((Date.parse(S.server_time) - Date.parse(ts)) / 1000) + " ago"; }
   function line(note) {
     if (!note) return "";
-    var seg = note.split(/[\uff1b;\u3002\n]/).map(function (x) { return x.trim(); }).filter(Boolean);
-    if (!seg.length) return ""; var out = seg[0]; if (out.length < 14 && seg[1]) out += "; " + seg[1]; return out;
+    var seg = note.split(/[；;。\n]/).map(function (x) { return x.trim(); }).filter(Boolean);
+    if (!seg.length) return ""; var out = seg[0]; if (out.length < 14 && seg[1]) out += "；" + seg[1]; return out;
   }
 
   // ---------- data helpers ----------
@@ -63,7 +63,8 @@
   function thr(id) { for (var i = 0; i < S.threads.length; i++) if (S.threads[i].id === id) return S.threads[i]; return null; }
   function areaLabel(id) { for (var i = 0; i < S.areas.length; i++) if (S.areas[i].id === id) return S.areas[i].label; return "Unsorted"; }
   function areaOf(r) { var t = r.thread && thr(r.thread); return r.area || (t && t.area) || ""; }
-  function vis(r) { return !r.merged_into; }
+  function isTest(r) { var n = r.title || r.name || ""; return /^(zz-|e2e-|hook-e2e)/i.test(r.id || "") || /^(E2E\b|ACCEPTANCE TEST)/i.test(n); }
+  function vis(r) { return !r.merged_into && !isTest(r); }
   function closed(r) { return r.status === "done" || r.status === "dropped"; }
   function threadTitle(r) { var t = r.thread && thr(r.thread); return t ? t.title : ""; }
   function pr(p) { return { p0: 0, p1: 1, p2: 2, p3: 3 }[p] === undefined ? 9 : { p0: 0, p1: 1, p2: 2, p3: 3 }[p]; }
@@ -144,14 +145,14 @@
     else t.textContent = "Muse updated " + ago(m.last_update);
   }
 
-  // ---------- context line: latest phone observation (never claims where the user is now) ----------
+  // ---------- context line: latest Chronicle observation (never claims where the user is now) ----------
   function renderContext() {
     var el = document.getElementById("context-line"), c = S.context, l = c && c.latest;
     if (lost || !l || !l.fresh) { el.hidden = true; el.textContent = ""; return; }      // past the TTL it is no longer a live signal
     var place = { home: "Home", office: "Office" }[l.place] || l.place, verb = l.type === "geofence_exit" ? "left" : "entered";
     var clock = new Date(l.observed_at).toLocaleTimeString([], withTz(TOPT));
     el.textContent = "";
-    add(el, h("span", "dot"), h("span", null, "Phone detected: " + verb + " " + place + " geofence · " + clock + " · " + dur(l.age_seconds) + " ago"));
+    add(el, h("span", "dot"), h("span", null, "Chronicle detected: " + verb + " " + place + " geofence · " + clock + " · " + dur(l.age_seconds) + " ago"));
     el.title = "Geofence event reported by the phone at " + clock + ". It is an observation, not confirmation of where you are now.";
     el.hidden = false;
   }
@@ -172,27 +173,46 @@
     add(b, h("div", "focus-title", f.title), f.reason ? h("div", "focus-reason", f.reason) : null);
     if (th && th.next_step && !closed(th)) add(b, add(h("div", "s next"), h("b", null, "Next: "), document.createTextNode(th.next_step)));
     var meta = h("div", "focus-meta"), n = 0;
-    if (th) { add(meta, add(h("span"), document.createTextNode("Project "), h("b", null, th.title))); n++; }
-    else { var name = ""; S.projects.forEach(function (p) { if (p.id === f.project) name = p.name; }); if (name) { add(meta, add(h("span"), document.createTextNode("Project "), h("b", null, name))); n++; } }
+    if (th) { add(meta, add(h("span"), document.createTextNode("About "), h("b", null, th.title))); n++; }
+    else { var name = ""; S.projects.forEach(function (p) { if (p.id === f.project) name = p.name; }); if (name) { add(meta, add(h("span"), document.createTextNode("About "), h("b", null, name))); n++; } }
     if (f.deadline) { add(meta, add(h("span"), document.createTextNode("Due "), h("b", null, fmtDate(f.deadline) + (fmtTime(f.deadline) ? " · " + fmtTime(f.deadline) : "")))); n++; }
-    if (f.basis === "recommended") { add(meta, h("span", null, "Muse recommendation")); n++; }
     if (n) b.appendChild(meta);
     var mine = S.queue.filter(function (q) { return vis(q) && isRecommended(q) && (q.status === "active" || q.status === "blocked") && q.plan_state !== "today"; });
     mine.slice(0, 2).forEach(function (q) { add(b, add(h("div", "s next"), h("b", null, "In progress: "), document.createTextNode(q.title))); });
-    if (th) { var bs = h("div", "btns"); add(bs, openBtn(th.id)); b.appendChild(bs); }
+    var fa = focusAction();
+    if (fa) { var bs = h("div", "btns"); add(bs, fa.target ? gotoBtn(fa.label, fa.target) : openBtn(fa.thread, fa.label)); b.appendChild(bs); }
   }
+  // the main button follows what the recommendation really is: a decision to make, a task to look at, or progress to follow
+  function focusAction() {
+    var l = focusLink(), th = l.thread; if (!th) return null;
+    var ask = S.inbox.filter(function (i) { return vis(i) && i.thread === th.id && (i.status === undefined || i.status === "open"); })[0];
+    if (ask) return { label: ask.options && ask.options.length ? "Choose an option" : "See what is needed", target: "needs-you" };
+    return { label: l.task ? "View task" : "View progress", thread: th.id };
+  }
+  function gotoBtn(label, target) { var x = h("button", "btn primary", label); x.type = "button"; x.setAttribute("data-ui", "goto"); x.setAttribute("data-target", target); return x; }
   function tlink(text, tid) {
     if (!tid || !thr(tid)) return h("span", null, text);
     var a = h("a", "tlink", text); a.href = "#thread=" + tid; a.setAttribute("data-ui", "open-thread"); a.setAttribute("data-thread", tid); return a;
   }
   function openBtn(tid, label) { var x = h("button", "btn primary", label || "Open"); x.type = "button"; x.setAttribute("data-ui", "open-thread"); x.setAttribute("data-thread", tid); return x; }
 
+  function leadOf(t) {          // first sentence (or ~200 characters) shown up front; the full text stays one tap away
+    if (t.length <= 220) return t;
+    var m = /^(.{40,220}?[.!?\u3002\uff01\uff1f])(\s|$)/.exec(t); return m ? m[1] : t.slice(0, 200).replace(/\s+\S*$/, "") + "\u2026";
+  }
   function askCard(i) {
     var c = h("div", "ask" + (i.sensitive ? " sens" : ""));
     var top = h("div", "row2"); add(top, h("div", "t", i.title), i.sensitive ? chip("Sensitive · confirm here only", "red") : null);
-    add(c, top, i.detail ? h("div", "s", i.detail) : null);
+    add(c, top);
+    var th = i.thread && thr(i.thread);
+    if (i.detail) {
+      var full = i.detail, lead = leadOf(full);
+      add(c, h("div", "s full", lead));
+      if (lead.length < full.length) { var dd = details("ask:" + i.id, "more", "Show details"); dd.appendChild(h("div", "s full", full)); c.appendChild(dd); }
+    }
+    if (th) add(c, add(h("div", "about"), document.createTextNode("About "), tlink(th.title, th.id)));
     var bs = h("div", "btns");
-    if (i.status === "open" || i.status === "acknowledged") {
+    if (i.status === undefined || i.status === "open" || i.status === "acknowledged") {
       if (i.options && i.options.length) i.options.forEach(function (o) { add(bs, btn(o, "choose", "inbox", i.id, { option: o })); });
       else if (i.kind === "confirm") add(bs, btn("Confirm", "confirm", "inbox", i.id, null, "primary"), btn("Not me / decline", "decline", "inbox", i.id, null, i.sensitive ? "warn" : ""));
       else if (i.kind === "alert") add(bs, btn("Acknowledge", "ack", "inbox", i.id, null, "primary"));
@@ -247,21 +267,45 @@
     if (!S.focus) return false; var l = focusLink();
     return !!((l.task && q.id === l.task.id) || (!l.task && l.thread && q.thread === l.thread.id));
   }
+  function trackRow(g) {
+    var t = g.thread, r = h("div", "trk"), top = h("div", "row2");
+    add(top, h("div", "t", t ? t.title : g.qs[0].title), h("span", "state amber", "Waiting"));
+    r.appendChild(top);
+    var prog = line((t && (t.summary || t.next_step)) || g.qs[0].note || "");
+    if (prog) r.appendChild(h("div", "s full", prog));
+    var nx = t && t.next_step ? t.next_step : "";
+    if (nx) r.appendChild(add(h("div", "s full next"), h("b", null, "Next: "), document.createTextNode(line(nx))));
+    var meta = [];
+    if (g.qs.length > 1 || t) meta.push(g.qs.length + (g.qs.length === 1 ? " task" : " tasks") + " waiting");
+    if (g.upd) meta.push("updated " + ago(g.upd));
+    if (meta.length) r.appendChild(h("div", "more", meta.join(" \u00b7 ")));
+    if (t) { var bs = h("div", "btns"), ob = openBtn(t.id, "Open"); ob.className = "btn"; add(bs, ob); r.appendChild(bs); }
+    return r;
+  }
   function renderMotion() {
     var b = body("in-progress");
     var live = S.queue.filter(function (q) { return vis(q) && q.plan_state !== "today" && !isRecommended(q) && (q.status === "active" || q.status === "blocked") && !(q.thread && thr(q.thread) && closed(thr(q.thread))); });
     live.sort(function (a, c) { return pr(a.priority) - pr(c.priority) || (a.order || 99) - (c.order || 99); });
-    var wait = S.queue.filter(function (q) { return vis(q) && q.plan_state !== "today" && q.status === "waiting"; });
-    document.getElementById("in-progress").hidden = !live.length && !wait.length;
-    if (!live.length && !wait.length) return;
+    var by = {}, groups = [];
+    S.queue.forEach(function (q) {            // waiting work, grouped by the real-world item it belongs to
+      if (!vis(q) || q.plan_state === "today" || q.status !== "waiting") return;
+      var th = q.thread && thr(q.thread); if (th && closed(th)) return;
+      var k = th ? th.id : "q:" + q.id;
+      if (!by[k]) { by[k] = { thread: th, qs: [], upd: "" }; groups.push(by[k]); }
+      by[k].qs.push(q); var u = (th && th.updated_at) || q.updated_at || ""; if (u > by[k].upd) by[k].upd = u;
+    });
+    groups.sort(function (a, c) { return a.upd < c.upd ? 1 : a.upd > c.upd ? -1 : 0; });
+    document.getElementById("in-progress").hidden = !live.length && !groups.length;
+    if (!live.length && !groups.length) return;
     live.slice(0, 6).forEach(function (q) { b.appendChild(qrow(q)); });
     if (live.length > 6) {
       var d = details("motion-more", "more", (live.length - 6) + " more in motion");
       live.slice(6).forEach(function (q) { d.appendChild(qrow(q)); }); b.appendChild(d);
     }
-    if (wait.length) {
-      var w = details("motion-wait", "more", "Waiting (" + wait.length + ")");
-      wait.forEach(function (q) { w.appendChild(qrow(q)); }); b.appendChild(w);
+    groups.slice(0, 3).forEach(function (g) { b.appendChild(trackRow(g)); });
+    if (groups.length > 3) {
+      var w = details("motion-wait", "more", (groups.length - 3) + " more being tracked");
+      groups.slice(3).forEach(function (g) { w.appendChild(trackRow(g)); }); b.appendChild(w);
     }
   }
 
@@ -294,6 +338,19 @@
       }
       res.push(x);
     });
+    var merged = [], by2 = {};      // same item, same day: a date-only record and a timed one are one real-world event (display only)
+    res.forEach(function (x) {
+      if (x.kind === "Reminder" || x.kind === "Plan" || !x.rec.thread) { merged.push(x); return; }
+      var k = x.rec.thread + "#" + dayNum(x.ts), pv = by2[k];
+      if (pv && (pv.dateOnly || x.dateOnly)) {
+        var host = pv.dateOnly && !x.dateOnly ? x : pv, other = host === pv ? x : pv;
+        host.also = host.also.concat([other], other.also); host.reminders = host.reminders.concat(other.reminders);
+        if (host === x) { merged[merged.indexOf(pv)] = x; by2[k] = x; }
+        return;
+      }
+      by2[k] = x; merged.push(x);
+    });
+    res = merged;
     res.forEach(function (x) {   // conservative certainty across merged sources
       var all = [x].concat(x.also); var c = 9;
       all.forEach(function (y) { if (y.sec === "schedule") c = Math.min(c, CERT[y.rec.status] === undefined ? 1 : CERT[y.rec.status]); });
@@ -306,11 +363,11 @@
     if (x.ts < n && (x.kind === "Deadline" || (x.kind === "Plan" && x.rec.plan_state === "overdue"))) return "Overdue";
     if (d <= 0) return "Today"; if (d === 1) return "Tomorrow"; if (d <= 7) return "This week"; if (d <= 30) return "Next 30 days"; if (d <= 90) return "Later"; return "Horizon";
   }
-  function tlRow(x) {
+  function tlRow(x, bk) {
     var wrap = h("div", "card-row"), r = h("div", "tl"), n = nowS(), key = "tl:" + x.sec + ":" + x.rec.id;
-    add(r, h("div", "when", fmtTs(x.ts, x.dateOnly)));
+    add(r, h("div", "when", (bk === "Today" || bk === "Tomorrow") && !x.dateOnly ? new Date(x.ts * 1000).toLocaleTimeString([], withTz(TOPT)) : fmtTs(x.ts, x.dateOnly)));
     var m = h("div"), t = h("div", "t", x.rec.title || x.rec.name);
-    t.appendChild(h("span", "chip2", x.kind));
+    if (x.kind !== "Event") t.appendChild(h("span", "chip2", x.kind));
     var fl = S.focus ? focusLink() : null;
     if (fl && ((fl.task && x.rec.id === fl.task.id && x.sec === "queue") || (fl.thread && x.rec.thread === fl.thread.id))) t.appendChild(h("span", "chip2 rec", "Recommended"));
     var th = threadTitle(x.rec), subs = [];
@@ -319,7 +376,9 @@
     if (x.kind === "Reminder") { var ri = remInfo(x.rec); if (ri.stopped) subs.push("Stopped"); if (ri.tag) subs.push(ri.tag); }
     if (x.kind === "Event" && x.rec.attendance === "not_going") subs.push("Not attending");
     else if (x.rec.status === "unconfirmed" || x.cert === 0) subs.push("Not confirmed"); else if (x.rec.status === "tentative") subs.push("Tentative");
-    x.reminders.forEach(function (y) { if (y.ts !== x.ts) subs.push("Reminder " + fmtTs(y.ts, false).split(" · ").pop()); });
+    x.reminders.forEach(function (y) { if (y.ts !== x.ts) subs.push("Reminder " + fmtTs(y.ts, false).split(" \u00b7 ").pop()); });
+    var al = []; x.also.forEach(function (y) { if (y.kind !== x.kind && al.indexOf(y.kind.toLowerCase()) < 0) al.push(y.kind.toLowerCase()); });
+    if (al.length) subs.push("Also listed as " + al.join(" and "));
     if (x.kind === "Deadline" && x.rec.basis === "unknown" && x.rec.due.length === 10) subs.push("Date not confirmed");
     var pn = pendingNote(x.sec, x.rec.id); if (pn) subs.push(pn);
     add(m, t, subs.length ? h("div", "sub" + (x.kind === "Reminder" && remInfo(x.rec).bad ? " red" : ""), subs.join(" · ")) : null); r.appendChild(m);
@@ -338,13 +397,29 @@
   }
   function renderUpcoming() {
     var sec = document.getElementById("upcoming"), b = body("upcoming"), n = nowS();
-    var items = timeline().filter(function (x) { return x.ts < n + 7 * DAY && !(x.kind === "Plan" && x.rec.plan_state === "overdue") && !(x.kind === "Event" && x.rec.attendance === "not_going") && !(x.kind === "Reminder" && remInfo(x.rec).stopped); });
+    var all = timeline().filter(function (x) { return !(x.kind === "Plan" && x.rec.plan_state === "overdue") && !(x.kind === "Event" && x.rec.attendance === "not_going") && !(x.kind === "Reminder" && remInfo(x.rec).stopped); });
+    var cnt = {};     // an event that keeps coming back (dinner, a daily run) is a routine, not news
+    all.forEach(function (x) { if (x.kind === "Event" && x.ts < n + 14 * DAY) { var k = (x.rec.title || "").toLowerCase(); cnt[k] = (cnt[k] || 0) + 1; } });
+    var main = [], habits = [];
+    all.forEach(function (x) {
+      if (x.ts >= n + (x.kind === "Deadline" ? 14 : 7) * DAY) return;           // formal deadlines are shown two weeks ahead
+      (x.kind === "Event" && cnt[(x.rec.title || "").toLowerCase()] >= 3 ? habits : main).push(x);
+    });
     var missed = plannedList("overdue");
-    sec.hidden = !items.length && !missed.length;
+    sec.hidden = !main.length && !habits.length && !missed.length;
     if (sec.hidden) return;
-    var lastB = "";
-    items.slice(0, 8).forEach(function (x) { var k = bucket(x, n); if (k !== lastB) { b.appendChild(h("div", "day", k)); lastB = k; } b.appendChild(tlRow(x)); });
-    if (items.length > 8) b.appendChild(h("div", "more", (items.length - 8) + " more — see Timeline"));
+    var dl = main.filter(function (x) { return x.kind === "Deadline"; }).slice(0, 3), keep = dl.slice();      // formal deadlines always make it onto Home
+    main.forEach(function (x) { if (keep.length < 8 && keep.indexOf(x) < 0) keep.push(x); });
+    var shown = main.filter(function (x) { return keep.indexOf(x) >= 0; });
+    var lastB = "", bk;
+    shown.forEach(function (x) { bk = bucket(x, n); if (bk !== lastB) { b.appendChild(h("div", "day", bk)); lastB = bk; } b.appendChild(tlRow(x, bk)); });
+    if (main.length > shown.length) b.appendChild(h("div", "more", (main.length - shown.length) + " more \u2014 see Timeline"));
+    if (!main.length) b.appendChild(h("div", "empty", "Nothing important coming up."));
+    if (habits.length) {
+      var nx = habits[0], hd = details("habits", "more", "Daily routines (" + habits.length + ") \u00b7 next: " + (nx.rec.title || "") + " in " + short(Math.max(0, nx.ts - n)));
+      var lb = ""; habits.forEach(function (x) { var k = bucket(x, n); if (k !== lb) { hd.appendChild(h("div", "day", k)); lb = k; } hd.appendChild(tlRow(x, k)); });
+      b.appendChild(hd);
+    }
     if (missed.length) { var mm = details("today-missed", "more", "Missed plans (" + missed.length + ")"); missed.forEach(function (q) { mm.appendChild(prow(q, true)); }); b.appendChild(mm); }
   }
   function renderTimeline() {
@@ -352,7 +427,7 @@
     if (tzLabel()) b.appendChild(h("div", "tznote", "All times are " + tzLabel() + (S.tz ? " (" + S.tz + ")" : "") + "."));
     if (!items.length) return empty(b, "Nothing scheduled.");
     var lastB = "";
-    items.forEach(function (x) { var k = bucket(x, n); if (k !== lastB) { b.appendChild(h("div", "day", k)); lastB = k; } b.appendChild(tlRow(x)); });
+    items.forEach(function (x) { var k = bucket(x, n); if (k !== lastB) { b.appendChild(h("div", "day", k)); lastB = k; } b.appendChild(tlRow(x, k)); });
   }
 
   // ---------- AREAS: threads grouped by life area ----------
@@ -442,11 +517,11 @@
     var sm = d.querySelector("summary"), top = h("div", "thr-top");
     var left = h("div", "t", t.title);
     var tags = h("div", "chips");
-    if (t.stage) add(tags, chip(t.stage, "green")); else if (t.status !== "active") add(tags, chip({ waiting: "Waiting", paused: "Paused", done: "Archived", dropped: "Dropped" }[t.status] || t.status));
+    if (t.stage) add(tags, /^unknown$/i.test(t.stage) ? chip("Unknown") : chip(t.stage, "green")); else if (t.status !== "active") add(tags, chip({ waiting: "Waiting", paused: "Paused", done: "Archived", dropped: "Dropped" }[t.status] || t.status));
     if (closed(t) && imp.tasks - imp.waiting > 0) add(tags, chip((imp.tasks - imp.waiting) + " open", "amber"));
     else if (closed(t) && imp.waiting) add(tags, chip("tracking " + imp.waiting));
     var nUa = actionsOn() ? (t.ui_actions || []).filter(function (u) { return !u.expired; }).length : 0;
-    if (nUa) add(tags, chip("● " + nUa + " actionable", "amber"));
+    if (nUa) add(tags, chip("\u25CF " + nUa + (nUa === 1 ? " action available" : " actions available"), "amber"));
     add(top, left, nx ? chip(fmtTs(nx.ts, nx.dateOnly), "") : tags);
     add(sm, top, (t.summary || t.next_step) ? h("div", "thr-sum", line(t.summary || t.next_step)) : null);
     if (nx && (t.stage || t.status !== "active")) top.appendChild(tags);
@@ -461,7 +536,7 @@
       d.appendChild(st);
     }
     var uab = uaBlock(t); if (uab) d.appendChild(uab);
-    if (t.summary) d.appendChild(h("div", "s", t.summary));
+    if (t.summary) d.appendChild(h("div", "s full", t.summary));       // the whole text, line breaks kept (a weekly menu, a plan...): never cut to two lines
     if (t.next_step) d.appendChild(add(h("div", "s"), h("b", null, "Next: "), document.createTextNode(t.next_step)));
     if (closed(t) && impactText(imp)) d.appendChild(h("div", "note-box", (imp.tasks - imp.waiting > 0 ? "Archived, but still attached: " : "Archived. Muse keeps tracking: ") + impactText(imp) + ". Reminders, deadlines and routines keep running; waiting tasks stay tracked."));
     var openQ = rel.queue.filter(function (q) { return vis(q) && !closed(q); }), box = h("div", "rel");
@@ -484,21 +559,22 @@
     if (src.length) d.appendChild(h("div", "src", "Sources: " + src.join(" · ")));
     var acts = S.actions.filter(function (a) { return rel.queue.concat(rel.deadlines, rel.inbox).some(function (r) { return r.id === a.target; }) || a.target === t.id; }).slice(0, 2);
     if (acts.length) d.appendChild(h("div", "src", "You: " + acts.map(function (a) { return a.type.replace("_", " ") + " " + a.target + " (" + ago(a.ts) + ")"; }).join(" · ")));
-    var more = btn(closed(t) ? "Reopen" : "Archive thread…", closed(t) ? "reopen" : "done", "threads", t.id);
+    var more = btn(closed(t) ? "Reopen" : "Archive…", closed(t) ? "reopen" : "done", "threads", t.id);
     if (more) { var mn = h("details", "sec"), ms = h("summary", null, "···"); ms.setAttribute("aria-label", "More"); add(mn, ms, more); d.appendChild(mn); }
     return d;
   }
   function renderMatters() {
     var b = body("matters"), any = false;
-    S.areas.filter(function (a) { return a.id !== "system"; }).concat([{ id: "", label: "Unsorted" }]).forEach(function (a) {
-      var ths = S.threads.filter(function (t) { return (t.area || "") === a.id && !closed(t); });
+    S.areas.filter(function (a) { return a.id !== "system"; }).concat([{ id: "", label: "Not grouped yet" }]).forEach(function (a) {
+      var ths = S.threads.filter(function (t) { return (t.area || "") === a.id && !closed(t) && !isTest(t); });
       var orphans = ["queue", "deadlines", "schedule", "projects"].reduce(function (acc, k) {
         return acc.concat(S[k].filter(function (r) { return vis(r) && !r.thread && areaOf(r) === a.id && !closed(r) && !r.past; }).map(function (r) { return { k: k, r: r }; }));
       }, []);
       if (!ths.length && !orphans.length) return;
       any = true;
       var d = details("area:" + a.id, "area", null), s2 = d.querySelector("summary");
-      add(s2, h("span", null, a.label), h("span", "n", ths.length + (ths.length === 1 ? " thread" : " threads")));
+      var cnt = ths.length + orphans.length;
+      add(s2, h("span", null, a.label), h("span", "n", cnt + (cnt === 1 ? " item" : " items")));
       ths.forEach(function (t) { d.appendChild(threadCard(t)); });
       if (orphans.length) {
         var box = h("div", "rel"); box.appendChild(h("div", "grp", "Not yet grouped"));
@@ -507,7 +583,7 @@
       }
       b.appendChild(d);
     });
-    var arch = S.threads.filter(function (t) { return closed(t) && t.area !== "system"; }), recs = [], merged = 0;
+    var arch = S.threads.filter(function (t) { return closed(t) && t.area !== "system" && !isTest(t); }), recs = [], merged = 0;
     ["queue", "deadlines", "projects", "inbox"].forEach(function (k) { S[k].forEach(function (r) { if (r.merged_into) merged++; else if ((closed(r) || ["confirmed", "declined", "resolved", "acknowledged"].indexOf(r.status) >= 0) && !(r.thread && thr(r.thread) && closed(thr(r.thread)))) recs.push({ k: k, r: r }); }); });
     ["schedule", "automations"].forEach(function (k) { S[k].forEach(function (r) { if (r.merged_into) merged++; }); });
     if (arch.length || recs.length || merged) {
@@ -526,7 +602,7 @@
       if (merged) ad.appendChild(h("div", "more", merged + " duplicate record(s) are merged into others and kept for history."));
       b.appendChild(ad);
     }
-    if (!any) empty(b, "No threads yet. Muse organises everything into threads and areas.");
+    if (!any) empty(b, "Nothing here yet. Muse groups everything by area.");
   }
 
   // ---------- locate: Open on the recommendation expands the same thread ----------
@@ -549,10 +625,16 @@
     if (x.dateOnly) return (x.rec.due || x.rec.start || "").slice(0, 10);
     return tsDate(x.ts);
   }
-  function weekItem(x) {        // no clock times here: order within a day is chronological, the day is what matters
+  function weekItem(x) {        // clock times shown when the item has one; order within a day stays chronological
     var muted = (x.kind === "Event" && x.rec.attendance === "not_going");
     var el = h("div", "wk-item " + x.kind.toLowerCase() + (muted ? " muted" : "")), t = h("div", "wk-time");
-    t.textContent = x.kind === "Deadline" ? "Due" : x.kind === "Plan" ? "Plan" + (x.rec.time_hint ? " · " + HINT[x.rec.time_hint] : "") : x.kind;
+    var clock = "";
+    if (!x.dateOnly && x.ts) {
+      clock = new Date(x.ts * 1000).toLocaleTimeString([], withTz(TOPT));
+      if (x.kind === "Event" && x.rec.end) { var ce = fmtTime(x.rec.end); if (ce && ce !== clock) clock += " – " + ce; }
+    }
+    var wlabel = x.kind === "Deadline" ? "Due" : x.kind === "Plan" ? "Plan" + (x.rec.time_hint ? " · " + HINT[x.rec.time_hint] : "") : x.kind;
+    t.textContent = clock ? (x.kind === "Event" ? clock : clock + " · " + wlabel) : wlabel;
     var title = h("div", "wk-title"); title.appendChild(tlink(x.rec.title || x.rec.name, x.rec.thread));
     add(el, t, title);
     var tags = [];
@@ -581,11 +663,11 @@
       grid.appendChild(col);
     }
     b.appendChild(grid);
-    b.appendChild(h("div", "more", "Read-only. No clock times here: items are in chronological order within each day. Routines are not shown. Exact times are on the Timeline."));
+    b.appendChild(h("div", "more", "Read-only. Items are in chronological order within each day. Routines are not shown."));
   }
 
   // ---------- LOG ----------
-  function sentence(msg) { var m = /^(.{8,140}?[\u3002\uff01\uff1f.!?\uff1b;\uff1a:])\s*/.exec(msg); return m ? m[1] : (msg.length > 120 ? msg.slice(0, 117) + "…" : msg); }
+  function sentence(msg) { var m = /^(.{8,140}?[。！？.!?；;：:])\s*/.exec(msg); return m ? m[1] : (msg.length > 120 ? msg.slice(0, 117) + "…" : msg); }
   function renderLog() {
     var b = body("log");
     var tabs = h("div", "tabs");
@@ -611,10 +693,11 @@
     if (rows.length > logLimit) { var m = h("button", "btn", "Show more (" + (rows.length - logLimit) + ")"); m.type = "button"; m.setAttribute("data-ui", "log-more"); b.appendChild(m); }
   }
 
-  // ---------- SYSTEM ----------
+  // ---------- SYSTEM: a plain status line first; the developer detail stays complete but folded ----------
   function renderRoutines() {
     var b = body("routines"), a = S.automations.filter(function (x) { return vis(x) && x.kind !== "once"; });
     if (!a.length) return empty(b, "No recurring routines recorded.");
+    var box = details("sys-routines", "more", a.length + " recurring routines \u2014 show");
     function tod(x) { if (!x.when_ts) return "Unscheduled"; var hr = new Date(x.when_ts * 1000).getHours(); return hr < 12 ? "Morning" : hr < 18 ? "Afternoon" : "Evening"; }
     var groups = [["Always on", function (x) { return x.kind === "always"; }]];
     ["Morning", "Afternoon", "Evening", "Unscheduled"].forEach(function (g) { groups.push([g + " (daily)", function (x) { return x.kind === "daily" && tod(x) === g; }]); });
@@ -622,28 +705,127 @@
     groups.forEach(function (g) {
       var items = a.filter(g[1]).sort(function (x, y) { return (x.when_ts ? new Date(x.when_ts * 1000).getHours() * 60 + new Date(x.when_ts * 1000).getMinutes() : 9999) - (y.when_ts ? new Date(y.when_ts * 1000).getHours() * 60 + new Date(y.when_ts * 1000).getMinutes() : 9999); });
       if (!items.length) return;
-      b.appendChild(h("div", "grp", g[0]));
+      box.appendChild(h("div", "grp", g[0]));
+      var seen = {};
       items.forEach(function (x) {
-        var r = h("div", "kvl"), l = h("span"); add(l, h("span", null, x.name), x.status === "failed" ? chip(" · failed", "red") : x.status === "paused" ? chip(" · paused") : null);
-        add(r, l, h("span", "tag", (x.frequency || "") + (x.when_ts ? " · next " + fmtTs(x.when_ts, false) : ""))); b.appendChild(r);
+        var k = x.name + "|" + (x.frequency || "") + "|" + (x.when_ts || ""); if (seen[k]) { seen[k].n++; return; }      // identical mirrors are listed once (display only)
+        var r = h("div", "kvl"), l = h("span"), nm = h("span", null, x.name); seen[k] = { n: 1, el: nm }; add(l, nm, x.status === "failed" ? chip(" \u00b7 failed", "red") : x.status === "paused" ? chip(" \u00b7 paused") : null);
+        add(r, l, h("span", "tag", (x.frequency || "") + (x.when_ts ? " \u00b7 next " + fmtTs(x.when_ts, false) : ""))); box.appendChild(r);
       });
+      Object.keys(seen).forEach(function (k) { if (seen[k].n > 1) seen[k].el.textContent += "  \u00d7" + seen[k].n; });
     });
+    b.appendChild(box);
     var once = S.automations.filter(function (x) { return vis(x) && x.kind === "once"; }).length;
     if (once) b.appendChild(h("div", "more", once + " one-time reminder(s) are shown with their events in the timeline."));
   }
   function renderSystem() {
     var b = body("system-status"), m = S.muse;
+    var state = lost ? ["red", "Connection lost \u2014 showing the last data received."] : m.freshness === "fresh" ? ["green", "Muse is reporting normally \u00b7 updated " + ago(m.last_update)] :
+      m.freshness === "aging" ? ["amber", "Muse is updating slowly \u00b7 last update " + ago(m.last_update)] : m.freshness === "stale" ? ["red", "No update from Muse for " + dur(m.age_seconds)] : ["", "Muse has not reported yet"];
+    b.appendChild(h("div", "state " + state[0] + " big", state[1]));
     function row(k, v) { return add(h("div", "kvl"), h("span", null, k), h("span", "tag", v)); }
-    add(b, row("Last Muse update", m.last_update ? ago(m.last_update) + " · " + m.freshness : "never"),
-      row("Click actions", S.human_actions_enabled ? (window.MuseActions && window.MuseActions.hasToken() ? "enabled on this device" : "enabled — first click asks for the token") : "disabled on server"),
+    var tech = details("sys-tech", "more", "Technical details");
+    add(tech, row("Last Muse update", m.last_update ? ago(m.last_update) + " \u00b7 " + m.freshness : "never"),
+      row("Click actions", S.human_actions_enabled ? (window.MuseActions && window.MuseActions.hasToken() ? "enabled on this device" : "enabled \u2014 first click asks for the token") : "disabled on server"),
       row("Actions Muse hasn't processed", String(S.unseen_actions)),
-      row("Threads", String(S.threads.length)), row("Records", String(S.queue.length + S.deadlines.length + S.schedule.length + S.projects.length + S.automations.length + S.inbox.length)));
-    var sysT = S.threads.filter(function (t) { return t.area === "system" && !closed(t); });
-    if (sysT.length) { b.appendChild(h("div", "grp", "System threads")); sysT.forEach(function (t) { b.appendChild(threadCard(t, true)); }); }
+      row("Items", String(S.threads.length)), row("Records", String(S.queue.length + S.deadlines.length + S.schedule.length + S.projects.length + S.automations.length + S.inbox.length)));
+    b.appendChild(tech);
+    var sysT = S.threads.filter(function (t) { return t.area === "system" && !closed(t) && !isTest(t); });
+    if (sysT.length) { var bg = details("sys-bg", "more", "Muse's own background items (" + sysT.length + ")"); sysT.forEach(function (t) { bg.appendChild(threadCard(t, true)); }); b.appendChild(bg); }
+    var tests = [];       // test and debug records never clutter daily views, but stay searchable here
+    S.threads.forEach(function (t) { if (isTest(t)) tests.push(t); });
+    var recs = [];
+    ["queue", "deadlines", "schedule", "automations", "inbox", "projects"].forEach(function (k) { S[k].forEach(function (r) { if (isTest(r)) recs.push(k + ": " + (r.title || r.name || r.id)); }); });
+    if (tests.length || recs.length) {
+      var td = details("sys-test", "more", "Test & debug items (" + (tests.length + recs.length) + ")");
+      tests.forEach(function (t) { td.appendChild(threadCard(t, true)); });
+      recs.forEach(function (x) { td.appendChild(h("div", "src", x)); });
+      b.appendChild(td);
+    }
+  }
+
+  // ---------- PAPERS: a few worth-reading papers per day (public metadata; Muse chooses, you only rate) ----------
+  var PAP = null, papTab = "today", papDays = 7, papSig = "", papBusy = false;
+  var SRC = { arxiv: "arXiv", huggingface: "Hugging Face", scholar: "Google Scholar", alphaxiv: "alphaXiv", other: "Link" };
+  function loadPapers(force) {
+    if (papBusy) return; papBusy = true;
+    fetch("/api/papers?days=" + papDays, { cache: "no-store" }).then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+      .then(function (d) { PAP = d; papSig = papSignature(); papBusy = false; renderPapers(); })
+      .catch(function () { papBusy = false; if (!PAP) { var b = body("papers"); empty(b, "Papers are unavailable right now."); } });
+  }
+  function papStatus(p) { return p.status; }
+  function papSignature() { return (S.papers || []).map(function (x) { return x.id + ":" + x.status; }).sort().join(","); }
+  function safeUrl(u) { return typeof u === "string" && u.indexOf("https://") === 0; }
+  function srcLinks(p) {
+    var box = h("div", "psrc");
+    (p.sources || []).forEach(function (s) {
+      if (!safeUrl(s.url)) return;
+      var a = h("a", "chip2", (SRC[s.name] || "Link") + " \u2197"); a.href = s.url; a.target = "_blank"; a.rel = "noopener noreferrer"; box.appendChild(a);
+    });
+    return box;
+  }
+  function projLabel(id) { var t = thr(id); if (t) return t.title; var r = null; S.projects.forEach(function (x) { if (x.id === id) r = x.name; }); return r; }
+  function papBtn(label, act, p, st, want) {
+    var on = st === want, b = actionsOn() ? btn(label, on ? "reopen" : act, "papers", p.id, null, on ? "primary" : "") : null;
+    if (b) { b.setAttribute("aria-pressed", on ? "true" : "false"); b.setAttribute("data-paper-action", act); }
+    return b;
+  }
+  function paperCard(p) {
+    var st = papStatus(p), c = h("div", "paper" + (st === "not_relevant" ? " muted" : "")), top = h("div", "row2");
+    var main = (p.sources || []).filter(function (s) { return safeUrl(s.url); }).sort(function (a, b2) { var o = { arxiv: 0, huggingface: 1, scholar: 2 }; return (o[a.name] === undefined ? 3 : o[a.name]) - (o[b2.name] === undefined ? 3 : o[b2.name]); })[0];
+    var tt = main ? h("a", "ptitle", p.title) : h("span", "ptitle", p.title);
+    if (main) { tt.href = main.url; tt.target = "_blank"; tt.rel = "noopener noreferrer"; }
+    add(top, tt, st !== "recommended" ? chip({ saved: "Saved", read_later: "Read later", not_relevant: "Not relevant" }[st] || st, st === "saved" ? "green" : "") : null);
+    c.appendChild(top);
+    var au = p.authors || [], meta = [au.slice(0, 3).join(", ") + (au.length > 3 ? " +" + (au.length - 3) : ""), p.published ? "Published " + fmtDate(p.published) : "", p.updated && p.updated !== p.published ? "Updated " + fmtDate(p.updated) : ""].filter(Boolean);
+    if (meta.length) c.appendChild(h("div", "pmeta", meta.join(" \u00b7 ")));
+    if (p.reason) c.appendChild(add(h("div", "s full why"), h("b", null, "Muse's reason: "), document.createTextNode(p.reason)));
+    if (p.quote) c.appendChild(p.quote_ok === true ? h("div", "pquote", "\u201c" + p.quote + "\u201d") : h("div", "pmeta", "Quote not found in the abstract \u2014 check the source."));       // only says the sentence is in the abstract, not that Muse's reason is right
+    var pj = (p.projects || []).map(projLabel).filter(Boolean);
+    if (pj.length) c.appendChild(h("div", "pmeta", "Matches: " + pj.join(", ")));
+    if (p.abstract) { var d = details("pabs:" + p.id, "more", "Abstract (from the source)"); d.appendChild(h("div", "s full", p.abstract)); c.appendChild(d); }
+    c.appendChild(srcLinks(p));
+    var known = (S.papers || []).some(function (x) { return x.id === p.id; });
+    if (known && actionsOn()) { var bs = h("div", "btns"); add(bs, papBtn("Save", "save", p, st, "saved"), papBtn("Read later", "read_later", p, st, "read_later"), papBtn("Not relevant", "not_relevant", p, st, "not_relevant")); c.appendChild(bs); }
+    return c;
+  }
+  function renderPapers() {
+    var b = body("papers"); if (!PAP) { if (view === "papers") { loadPapers(false); } empty(b, "Loading papers\u2026"); return; }
+    if (papSignature() !== papSig && !papBusy) { loadPapers(false); }       // a new pick or a rating from another device
+    var tabs = h("div", "tabs");
+    [["today", "Today"], ["saved", "Saved"], ["read_later", "Read later"], ["history", "History"]].forEach(function (t) {
+      var x = h("button", "btn", t[1]); x.type = "button"; x.setAttribute("data-ui", "pap-tab"); x.setAttribute("data-tab", t[0]); x.setAttribute("aria-pressed", papTab === t[0] ? "true" : "false"); tabs.appendChild(x);
+    });
+    b.appendChild(tabs);
+    var days = PAP.days, today = PAP.today;
+    if (papTab === "today") {
+      var d0 = days.filter(function (d) { return d.date === today; })[0], ps = d0 ? d0.papers : [];
+      var shown = ps.filter(function (p) { return papStatus(p) !== "not_relevant"; }), hid = ps.filter(function (p) { return papStatus(p) === "not_relevant"; });
+      shown.forEach(function (p) { b.appendChild(paperCard(p)); });
+      if (ps.length && !shown.length) b.appendChild(h("div", "empty", "Everything from today is hidden as not relevant."));
+      if (!ps.length) {
+        var latest = days.filter(function (d) { return d.date < today && d.papers.length; })[0];
+        b.appendChild(h("div", "empty", d0 ? (d0.note || "Nothing today was worth your time.") + (d0.candidates ? " (" + d0.candidates + " papers checked.)" : "") : "No picks yet today. Muse posts them once a day."));
+        if (latest) b.appendChild(h("div", "more", "Latest picks: " + fmtDate(latest.date) + " \u2014 see History."));
+      }
+      if (hid.length) { var hd = details("pap-hidden", "more", hid.length + " hidden as not relevant"); hid.forEach(function (p) { hd.appendChild(paperCard(p)); }); b.appendChild(hd); }
+    } else if (papTab === "saved" || papTab === "read_later") {
+      var want = papTab === "saved" ? "saved" : "read_later", n = 0;
+      days.forEach(function (d) { d.papers.filter(function (p) { return papStatus(p) === want; }).forEach(function (p) { n++; b.appendChild(h("div", "day", fmtDate(d.date))); b.appendChild(paperCard(p)); }); });
+      if (!n) b.appendChild(h("div", "empty", papTab === "saved" ? "Nothing saved yet." : "Nothing queued for later."));
+    } else {
+      days.forEach(function (d) {
+        var dd = details("pday:" + d.date, "more", fmtDate(d.date) + " \u00b7 " + (d.papers.length ? d.papers.length + (d.papers.length === 1 ? " pick" : " picks") : "no picks"));
+        d.papers.forEach(function (p) { dd.appendChild(paperCard(p)); });
+        if (!d.papers.length && d.note) dd.appendChild(h("div", "empty", d.note));
+        b.appendChild(dd);
+      });
+      if (PAP.next_before) { var mb = h("button", "btn", "Load older days"); mb.type = "button"; mb.setAttribute("data-ui", "pap-more"); b.appendChild(mb); }
+    }
   }
 
   // ---------- views, theme, polling ----------
-  var VIEWS = ["home", "week", "timeline", "log", "system"];
+  var VIEWS = ["home", "week", "timeline", "papers", "log", "system"];
   function showView() {
     var v = (location.hash || "#home").slice(1);
     if (v === "now" || v === "areas" || v === "matters" || v.indexOf("thread=") === 0) v = "home";      // old links keep working
@@ -652,6 +834,7 @@
     view = v;
     document.querySelector(".page").classList.toggle("wide", v === "week");
     VIEWS.forEach(function (k) { document.getElementById("view-" + k).hidden = k !== v; });
+    if (v === "papers" && S) loadPapers(false);
     var links = document.querySelectorAll("#nav a");
     for (var i = 0; i < links.length; i++) { if (links[i].getAttribute("data-view") === v) links[i].setAttribute("aria-current", "page"); else links[i].removeAttribute("aria-current"); }
   }
@@ -664,8 +847,8 @@
   }
   function render() {
     renderHeader(); renderContext(); renderFocus(); renderNeeds(); renderUpcoming(); renderMotion(); renderMatters();
-    renderWeek(); renderTimeline(); renderLog(); renderRoutines(); renderSystem();
-    ["week-grid", "focus", "needs-you", "upcoming", "in-progress", "matters", "timeline-full", "log", "routines", "system-status"].forEach(function (id) { document.getElementById(id).classList.toggle("dim", lost); });
+    renderWeek(); renderTimeline(); renderPapers(); renderLog(); renderRoutines(); renderSystem();
+    ["week-grid", "focus", "needs-you", "upcoming", "in-progress", "matters", "timeline-full", "papers", "log", "routines", "system-status"].forEach(function (id) { document.getElementById(id).classList.toggle("dim", lost); });
   }
   function poll() {
     var ctl = new AbortController(), to = setTimeout(function () { ctl.abort(); }, 4000);
@@ -687,8 +870,11 @@
       weekStart = ui === "week-today" ? S.today : addDays(cur < S.today ? S.today : cur, ui === "week-next" ? 7 : -7);
       history.replaceState(null, "", weekStart === S.today ? "#week" : "#week=" + weekStart); renderWeek(); return;
     }
+    if (ui === "goto") { var gt = document.getElementById(t.getAttribute("data-target")); if (gt) gt.scrollIntoView({ behavior: "smooth", block: "start" }); return; }
     if (ui === "menu") { var mk = t.getAttribute("data-key"); menuOpen = menuOpen === mk ? null : mk; if (S) render(); return; }
     if (ui === "open-thread") { var tid = t.getAttribute("data-thread"); history.replaceState(null, "", "#thread=" + tid); if (S) openThread(tid); return; }
+    if (ui === "pap-tab") { papTab = t.getAttribute("data-tab"); if (S) renderPapers(); return; }
+    if (ui === "pap-more") { papDays += 7; loadPapers(false); return; }
     if (ui === "log-tab") { logTab = t.getAttribute("data-tab"); logLimit = 10; if (S) renderLog(); }
     if (ui === "log-more") { logLimit += 15; if (S) renderLog(); }
     if (ui.indexOf("ua-") === 0 && S) {
@@ -704,7 +890,7 @@
     }
   });
   window.addEventListener("hashchange", function () { showView(); if (S) applyHash(); });
-  window.addEventListener("muse:refresh", function () { menuOpen = null; last = ""; poll(); });
+  window.addEventListener("muse:refresh", function () { menuOpen = null; last = ""; poll(); if (PAP) { papBusy = false; loadPapers(false); } });
 
   function currentTheme() {
     var t = document.documentElement.getAttribute("data-theme"); if (t === "dark" || t === "light") return t;

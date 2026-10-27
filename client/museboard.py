@@ -16,7 +16,7 @@ import urllib.request
 import uuid
 
 __all__ = ["update", "MuseError"]
-SECTIONS = ("focus", "threads", "inbox", "queue", "deadlines", "projects", "schedule", "automations", "journal", "heartbeat", "actions_seen", "action_results")
+SECTIONS = ("focus", "threads", "inbox", "queue", "deadlines", "projects", "schedule", "automations", "journal", "heartbeat", "actions_seen", "action_results", "events", "papers")
 
 
 class MuseError(Exception):

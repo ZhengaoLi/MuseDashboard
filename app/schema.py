@@ -5,7 +5,7 @@ from typing import Annotated, Literal, Optional, Union
 from zoneinfo import ZoneInfo
 import os
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field, StringConstraints, model_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, StringConstraints, field_validator, model_validator
 
 LOCAL = ZoneInfo(os.environ.get("TZ") or "UTC")
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -219,6 +219,80 @@ class JournalEntry(Base):
 
 JMsg = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=2000)]
 
+# --- Papers: daily reading recommendations (public metadata only; Muse chooses, the human gives light feedback) ---
+PAPER_HOSTS = ("arxiv.org", "huggingface.co", "scholar.google.com", "doi.org", "openreview.net", "aclanthology.org", "semanticscholar.org", "paperswithcode.com",
+               "alphaxiv.org", "proceedings.mlr.press", "proceedings.neurips.cc", "papers.nips.cc", "ieeexplore.ieee.org", "dl.acm.org", "nature.com", "science.org", "springer.com",
+               "sciencedirect.com", "biorxiv.org", "medrxiv.org", "github.com")
+
+
+def check_paper_url(u: str) -> str:
+    from urllib.parse import urlparse
+    p = urlparse(u)
+    host = (p.hostname or "").lower()
+    if p.scheme != "https" or p.username or p.password or len(u) > 300 or not any(host == h or host.endswith("." + h) for h in PAPER_HOSTS):
+        raise ValueError("source url must be https, without credentials, on a known paper host (%s)" % ", ".join(PAPER_HOSTS[:6]) + ", ...")
+    return u
+
+
+def check_day(s: str) -> str:
+    if not _DATE_RE.match(s):
+        raise ValueError("must be a calendar date YYYY-MM-DD")
+    try:
+        date.fromisoformat(s)
+    except ValueError:
+        raise ValueError("not a real date")
+    return s
+
+
+PaperUrl = Annotated[str, AfterValidator(check_paper_url)]
+DayStr = Annotated[str, AfterValidator(check_day)]
+
+
+_INVISIBLE = re.compile("[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]")
+
+
+def clean_text(v):
+    """Hidden characters (zero-width, bidi overrides, control codes) are a classic way to smuggle text; they have no place in a paper title or abstract."""
+    return _INVISIBLE.sub("", v) if isinstance(v, str) else v
+
+
+class PaperSource(Base):
+    name: Literal["arxiv", "huggingface", "scholar", "alphaxiv", "other"]
+    url: PaperUrl
+
+
+class PaperItem(Item):
+    """One recommended paper (kind "paper") or a per-day marker (kind "day": "Muse looked and nothing was worth your time").
+    Never put email text here: title, authors, abstract and links of the public paper only. The human's Save / Read later / Not relevant is NOT a field here."""
+    kind: Optional[Literal["paper", "day"]] = None
+    title: Optional[Title] = None
+    authors: Optional[list[Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=80)]]] = Field(default=None, max_length=40)
+    published: Optional[DayStr] = None
+    updated: Optional[DayStr] = None
+    abstract: Optional[Annotated[str, StringConstraints(strip_whitespace=True, max_length=3000)]] = None
+    arxiv_id: Optional[Annotated[str, StringConstraints(pattern=r"^(\d{4}\.\d{4,5}|[a-z-]+(\.[A-Z]{2})?/\d{7})(v\d+)?$")]] = None
+    doi: Optional[Annotated[str, StringConstraints(pattern=r"^((https?://(dx\.)?doi\.org/)|doi:)?10\.\d{4,9}/\S{1,150}$", max_length=200)]] = None
+    sources: Optional[list[PaperSource]] = Field(default=None, max_length=8)
+    projects: Optional[list[Id]] = Field(default=None, max_length=4)          # ids of the research threads/projects it matches
+    reason: Optional[Annotated[str, StringConstraints(strip_whitespace=True, max_length=500)]] = None
+    quote: Optional[Annotated[str, StringConstraints(strip_whitespace=True, max_length=300)]] = None    # a sentence copied from the abstract that supports the reason
+    quote_ok: Optional[bool] = None                                            # set by the server: is the quote really in the abstract?
+    rank: Optional[int] = Field(default=None, ge=1, le=5)
+    rec_date: Optional[DayStr] = None                                          # the local day it is recommended for
+    candidates: Optional[int] = Field(default=None, ge=0, le=100000)           # day marker: how many papers were considered
+    note: Optional[Annotated[str, StringConstraints(strip_whitespace=True, max_length=500)]] = None
+
+    @field_validator("title", "abstract", "reason", "quote", "note", mode="before")
+    @classmethod
+    def _clean(cls, v):
+        return clean_text(v)
+
+    @field_validator("authors", mode="before")
+    @classmethod
+    def _clean_authors(cls, v):
+        return [clean_text(x) for x in v] if isinstance(v, list) else v
+
+
 # section -> (model, label field, fields required on create)
 SECTIONS = {
     "threads": (ThreadItem, "title", ("area",)),
@@ -228,6 +302,7 @@ SECTIONS = {
     "projects": (ProjectItem, "name", ()),
     "schedule": (ScheduleItem, "title", ("start",)),
     "automations": (AutomationItem, "name", ()),
+    "papers": (PaperItem, "title", ()),
 }
 
 
@@ -235,6 +310,20 @@ class ActionResult(Base):
     id: int
     status: Literal["completed", "declined", "unable"]
     note: Optional[Annotated[str, StringConstraints(strip_whitespace=True, max_length=500)]] = None
+
+
+class MuseEvent(Base):
+    """Structured evidence Muse adds to a trajectory: what it predicted, what actually happened, a correction, or supporting evidence.
+    Keep facts and source references (e.g. "gmail:<message-id>"), never whole emails, and never credentials."""
+    event_id: Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,79}$")]       # stable: a retry with the same id is ignored
+    kind: Literal["prediction", "outcome", "correction", "evidence"]
+    ref_action: Optional[int] = None
+    section: Optional[Literal["queue", "deadlines", "threads", "inbox", "schedule", "automations"]] = None
+    target: Optional[Id] = None
+    thread: Optional[Id] = None
+    basis: Optional[Literal["user_stated", "external_evidence", "agent_inference"]] = None        # a user's claim is not external evidence
+    source: Optional[Annotated[str, StringConstraints(strip_whitespace=True, max_length=200)]] = None
+    data: Optional[dict] = None
 
 
 class UpdateRequest(Base):
@@ -246,18 +335,20 @@ class UpdateRequest(Base):
     projects: Optional[list[ProjectItem]] = None
     schedule: Optional[list[ScheduleItem]] = None
     automations: Optional[list[AutomationItem]] = None
+    papers: Optional[list[PaperItem]] = None
     journal: Optional[Union[JMsg, JournalEntry, list[Union[JMsg, JournalEntry]]]] = None
     heartbeat: Optional[bool] = None
     actions_seen: Optional[int] = None
     action_results: Optional[list[ActionResult]] = Field(default=None, max_length=50)
+    events: Optional[list[MuseEvent]] = Field(default=None, max_length=50)
     idempotency_key: Optional[Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_.:-]{1,128}$")]] = None
 
 
 class ActionRequest(Base):
     """A human click, sent by the protected UI script with the human token."""
     type: Literal["done", "reopen", "set_status", "set_stage", "ack", "confirm", "decline", "resolve", "choose", "ui_action",
-                  "not_attending", "attend", "stop_reminding", "resume_reminding"]
-    section: Literal["queue", "deadlines", "threads", "inbox", "schedule", "automations"]
+                  "not_attending", "attend", "stop_reminding", "resume_reminding", "save", "read_later", "not_relevant"]
+    section: Literal["queue", "deadlines", "threads", "inbox", "schedule", "automations", "papers"]
     id: Id
     params: Optional[dict] = None
     sensitive_ack: bool = False
@@ -266,7 +357,7 @@ class ActionRequest(Base):
 
 # --- Chronicle -> Dashboard context events (observations only; never instructions) ---
 CONTEXT_PLACES = ("home", "office")
-# The phone's native vocabulary -> (canonical type, place). Only Home/Office are stored in v1.
+# Chronicle's native phone vocabulary -> (canonical type, place). Only Home/Office are stored in v1.
 CHRONICLE_NATIVE = {"arrived_home": ("geofence_enter", "home"), "left_home": ("geofence_exit", "home"),
                     "arrived_office": ("geofence_enter", "office"), "left_office": ("geofence_exit", "office")}
 CHRONICLE_KNOWN_IGNORED = ("arrived_gym", "left_gym", "woke_up")
@@ -275,7 +366,7 @@ _TS = Annotated[str, StringConstraints(min_length=20, max_length=40)]
 
 
 class ContextNative(Base):
-    """What a phone automation (e.g. an iOS Shortcut) sends: {"event","device","ts"} (+ optional event_id)."""
+    """What the existing iOS Shortcut already sends to ntfy: {"event","device","ts"} (+ optional event_id)."""
     event: Annotated[str, StringConstraints(pattern=r"^[a-z_]{3,30}$")]
     device: Optional[Literal["iphone"]] = None
     ts: _TS

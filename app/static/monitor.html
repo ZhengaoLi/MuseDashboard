@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=1920, initial-scale=1">
+<title>Muse Monitor</title>
+<link rel="icon" type="image/svg+xml" href="/static/icon.svg">
+<link rel="stylesheet" href="/static/monitor.css">
+</head>
+<body>
+<div class="screen" id="screen">
+  <header>
+    <div class="clock"><span id="clock">--:--</span><span class="date" id="date"></span></div>
+    <div class="counts" id="counts"></div>
+    <div class="pulse" id="pulse"><span class="dot"></span><span id="pulse-text">Connecting…</span></div>
+  </header>
+  <main>
+    <div class="col">
+      <section class="panel hero" id="p-focus"><h2>FOCUS</h2><div class="rows"></div></section>
+      <section class="panel alert" id="p-needs" hidden><h2>NEEDS YOU</h2><div class="rows"></div></section>
+      <section class="panel grow" id="p-today"><h2>TODAY &amp; TOMORROW</h2><div class="rows"></div></section>
+      <section class="panel" id="p-week"><h2>LATER THIS WEEK</h2><div class="rows"></div></section>
+    </div>
+    <div class="col">
+      <section class="panel" id="p-deadlines"><h2>DEADLINES</h2><div class="rows"></div></section>
+      <section class="panel grow" id="p-tasks"><h2>TO DO</h2><div class="rows"></div></section>
+    </div>
+    <div class="col">
+      <section class="panel grow" id="p-waiting"><h2>WAITING ON</h2><div class="rows"></div></section>
+      <section class="panel" id="p-projects"><h2>PROJECTS</h2><div class="rows"></div></section>
+      <section class="panel" id="p-papers"><h2>PAPERS</h2><div class="rows"></div></section>
+    </div>
+  </main>
+</div>
+<script src="/static/monitor.js"></script>
+</body>
+</html>

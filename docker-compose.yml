@@ -8,6 +8,7 @@ services:
       MUSE_TOKEN: ${MUSE_TOKEN:?set MUSE_TOKEN in .env}
       MUSE_HUMAN_TOKEN: ${MUSE_HUMAN_TOKEN:-}
       CHRONICLE_TOKEN: ${CHRONICLE_TOKEN:-}
+      ALPHAXIV_API_KEY: ${ALPHAXIV_API_KEY:-}      # optional; used only by the read-only alphaXiv wrapper (app/alphaxiv.py)
       TZ: ${TZ:-UTC}
       FRESH_MINUTES: ${FRESH_MINUTES:-60}
       STALE_MINUTES: ${STALE_MINUTES:-360}

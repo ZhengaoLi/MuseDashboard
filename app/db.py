@@ -1,13 +1,17 @@
 """SQLite storage: schema, atomic updates, state snapshot."""
+import collections
 import hashlib
 import json
+import re
+import unicodedata
 import os
 import sqlite3
 import threading
 import time as _time
 from datetime import date, datetime, timedelta, timezone
 
-from .schema import AREAS, LOCAL, SECTIONS, JournalEntry, to_ts
+from . import trajectory as traj
+from .schema import AREAS, LOCAL, SECTIONS, JournalEntry, PaperSource, to_ts
 
 _write_lock = threading.Lock()
 STALE_FRESH_MIN = int(os.environ.get("FRESH_MINUTES", "60"))
@@ -27,6 +31,13 @@ CREATE TABLE IF NOT EXISTS context_events(id INTEGER PRIMARY KEY AUTOINCREMENT, 
   type TEXT NOT NULL, place TEXT NOT NULL, observed_ts REAL NOT NULL, observed_at TEXT NOT NULL, received_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS context_events_obs ON context_events(observed_ts);
 CREATE TABLE IF NOT EXISTS action_results(action_id INTEGER PRIMARY KEY, status TEXT NOT NULL, note TEXT, ts TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT UNIQUE NOT NULL, corr TEXT, ts TEXT NOT NULL, kind TEXT NOT NULL, actor TEXT NOT NULL,
+  section TEXT, target TEXT, thread TEXT, action_id INTEGER, data TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS events_target ON events(section,target);
+CREATE INDEX IF NOT EXISTS events_action ON events(action_id);
+CREATE INDEX IF NOT EXISTS events_corr ON events(corr);
+CREATE TRIGGER IF NOT EXISTS events_no_update BEFORE UPDATE ON events BEGIN SELECT RAISE(ABORT,'events is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS events_no_delete BEFORE DELETE ON events BEGIN SELECT RAISE(ABORT,'events is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS actions_no_update BEFORE UPDATE ON actions BEGIN SELECT RAISE(ABORT,'actions is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS actions_no_delete BEFORE DELETE ON actions BEGIN SELECT RAISE(ABORT,'actions is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS journal_no_update BEFORE UPDATE ON journal BEGIN SELECT RAISE(ABORT,'journal is append-only'); END;
@@ -122,22 +133,166 @@ def apply_update(req, payload: dict, idem_key):
             conn.close()
 
 
+# ---------- Papers: identity, de-duplication across sources, daily limit, checkable quote ----------
+MAX_PAPERS_PER_DAY = 5
+
+
+def _norm_arxiv(a):
+    a = re.sub(r"(?i)^(arxiv:|https?://arxiv\.org/(abs|pdf)/)", "", (a or "").strip())
+    a = re.sub(r"(\.pdf)?(v\d+)?$", "", a)
+    return a.lower() if a else ""
+
+
+def _norm_doi(d):
+    return re.sub(r"(?i)^(doi:|https?://(dx\.)?doi\.org/)", "", (d or "").strip()).lower()
+
+
+def _norm_text(t):
+    return re.sub(r"[^a-z0-9]+", " ", unicodedata.normalize("NFKD", t or "").lower()).strip()
+
+
+def paper_keys(d):
+    """Identity keys of a paper (any shared key = the same paper): arXiv id, DOI, normalised title."""
+    keys = []
+    a = _norm_arxiv(d.get("arxiv_id"))
+    if a: keys.append("arxiv:" + a)
+    doi = _norm_doi(d.get("doi"))
+    if doi: keys.append("doi:" + doi)
+    t = _norm_text(d.get("title"))
+    if len(t) >= 20: keys.append("t:" + hashlib.sha1(t.encode()).hexdigest()[:16])
+    return keys
+
+
+def paper_id(keys):
+    for k in keys:
+        if k.startswith("arxiv:"): return k
+    for k in keys:
+        if k.startswith("doi:"): return "doi:" + hashlib.sha1(k.encode()).hexdigest()[:16]
+    return keys[0] if keys else None
+
+
+def _union_sources(a, b):
+    out, seen = [], set()
+    for x in list(a or []) + list(b or []):
+        x = x if isinstance(x, dict) else x.model_dump()
+        if x["url"] not in seen:
+            seen.add(x["url"]); out.append(x)
+    return [PaperSource(**x) for x in out][:8]
+
+
+def _papers_prepass(conn, req, errors):
+    existing = {r["id"]: json.loads(r["data"]) for r in conn.execute("SELECT id,data FROM records WHERE section='papers'")}
+    index = {}
+    for rid, d in existing.items():
+        for k in paper_keys(d): index.setdefault(k, rid)
+    kept, by_id, final, dups = [], {}, {}, []
+    for i, it in enumerate(req.papers):
+        if it.delete:
+            kept.append(it); continue
+        fields = it.model_dump(exclude_unset=True, exclude={"id", "delete"})
+        cur = existing.get(it.id)
+        probe = {**(cur or {}), **fields}
+        kind = probe.get("kind") or "paper"
+        if kind == "day":
+            if not probe.get("rec_date"):
+                errors.append({"path": "papers.%d.rec_date" % i, "msg": "a day marker needs rec_date"}); continue
+            target = "day-" + probe["rec_date"]; cur = existing.get(target)
+        else:
+            keys = paper_keys(probe)
+            if not cur:
+                hit = next((index[k] for k in keys if k in index), None)
+                if hit:
+                    target, cur = hit, existing[hit]
+                    if (cur.get("kind") or "paper") != "day" and fields.get("rec_date") and fields["rec_date"] != cur.get("rec_date"):
+                        dups.append({"id": hit, "rec_date": cur.get("rec_date")})         # it was already recommended on another day: only the link is added
+                    for k in list(fields):                     # another source saw the same paper: add its link and fill gaps, never rewrite the recommendation
+                        if k != "sources" and cur.get(k) not in (None, "", [], {}):
+                            it.model_fields_set.discard(k); fields.pop(k)
+                elif keys: target = paper_id(keys)
+                else:
+                    errors.append({"path": "papers.%d" % i, "msg": "a new paper needs arxiv_id, doi, or a title of at least 20 characters so it can be de-duplicated"}); continue
+            else:
+                target = it.id
+        it.id = target
+        if cur and "sources" in fields:
+            it.sources = _union_sources(cur.get("sources"), fields["sources"])
+        if target in by_id:                                   # the same paper twice in one request: merge into the first
+            first = by_id[target]
+            for k in fields:
+                if k == "sources": first.sources = _union_sources(first.sources, fields["sources"])
+                else: setattr(first, k, getattr(it, k))
+            continue
+        by_id[target] = it; kept.append(it)
+        base = {**(cur or {}), **it.model_dump(exclude_unset=True, exclude={"id", "delete"})}
+        final[target] = (base, bool(cur))
+        if kind != "day":
+            if not cur:
+                for need, msg in (("title", "title"), ("rec_date", "rec_date (the local day it is recommended for)"), ("reason", "reason (why it is worth reading, specific and checkable)")):
+                    if not base.get(need): errors.append({"path": "papers.%d.%s" % (i, need), "msg": "a new paper needs " + msg})
+                if not base.get("sources"): errors.append({"path": "papers.%d.sources" % i, "msg": "a new paper needs at least one source link"})
+            q, ab = base.get("quote"), base.get("abstract")
+            if q or "quote_ok" in fields:                     # never trust the sender on this: it is recomputed from the stored abstract
+                it.quote_ok = (bool(ab) and _norm_text(q) in _norm_text(ab)) if q else None
+    req.papers = kept
+    per_day = collections.Counter()                           # at most MAX_PAPERS_PER_DAY recommendations per day, whatever the sender does
+    for rid, d in existing.items():
+        if rid not in final and (d.get("kind") or "paper") != "day" and d.get("rec_date"): per_day[d["rec_date"]] += 1
+    for rid, (d, _) in final.items():
+        if (d.get("kind") or "paper") != "day" and d.get("rec_date"):
+            per_day[d["rec_date"]] += 1
+            if per_day[d["rec_date"]] > MAX_PAPERS_PER_DAY:
+                errors.append({"path": "papers.%s.rec_date" % rid, "msg": "at most %d recommendations per day (%s)" % (MAX_PAPERS_PER_DAY, d["rec_date"])})
+    return dups
+
+
+def get_papers(days=7, before=None):
+    """Recommendations grouped by day, newest first. Full details (abstract etc.); the lightweight list in /api/state is only for the click layer."""
+    conn = connect()
+    try:
+        conn.execute("BEGIN")
+        recs = [{"id": r["id"], **json.loads(r["data"])} for r in conn.execute("SELECT id,data FROM records WHERE section='papers'")]
+        dates = sorted({r["rec_date"] for r in recs if r.get("rec_date") and (not before or r["rec_date"] < before)}, reverse=True)
+        page, more = dates[:days], len(dates) > days
+        out = []
+        for d in page:
+            day = [r for r in recs if r.get("rec_date") == d]
+            marker = next((r for r in day if r.get("kind") == "day"), None)
+            ps = sorted([r for r in day if r.get("kind") != "day"], key=lambda r: (r.get("rank") or 99, r.get("title", "")))
+            out.append({"date": d, "note": marker.get("note") if marker else None, "candidates": marker.get("candidates") if marker else None,
+                        "papers": [{**{k: v for k, v in r.items() if k not in ("kind", "human")}, "status": r.get("status", "recommended"),
+                                    "feedback_at": (r.get("human") or {}).get("at")} for r in ps]})
+        conn.execute("COMMIT")
+        return {"today": local_today().isoformat(), "days": out, "next_before": page[-1] if more else None}
+    finally:
+        conn.close()
+
+
 def _apply(conn, req, idem_key, h):
     now = now_iso()
     out = {"created": [], "updated": [], "deleted": [], "unchanged": [], "not_found": []}
     errors, touched, deleted = [], set(), set()
+    chg = []                                   # (kind, section, id, data) -> trajectory events, written with the audit row
 
     if "focus" in req.model_fields_set:
         if req.focus is None:
+            old = conn.execute("SELECT data FROM focus").fetchone()
             if conn.execute("DELETE FROM focus").rowcount:
-                out["deleted"].append("focus")
+                out["deleted"].append("focus"); chg.append(("record.deleted", "focus", "focus", {"last": traj.project(json.loads(old["data"])) if old else None}))
         else:
             data = req.focus.model_dump(exclude_none=True)
+            old = conn.execute("SELECT data FROM focus").fetchone()
+            oldd = json.loads(old["data"]) if old else {}
+            if oldd != data:
+                chg.append(("record.updated" if old else "record.created", "focus", "focus", {"changed": traj.diff(oldd, data)}))
             conn.execute("INSERT INTO focus(id,data,updated_at) VALUES(1,?,?) "
                          "ON CONFLICT(id) DO UPDATE SET data=excluded.data, updated_at=excluded.updated_at",
                          (json.dumps(data, ensure_ascii=False), now))
             out["updated"].append("focus")
 
+    if req.papers:
+        dups = _papers_prepass(conn, req, errors)
+        if dups:
+            out["already_recommended"] = dups                     # reported back so the sender picks a different paper for that day
     for sec, (_, label, required) in SECTIONS.items():
         items = getattr(req, sec)
         if not items:
@@ -153,7 +308,7 @@ def _apply(conn, req, idem_key, h):
             if it.delete:
                 if row:
                     conn.execute("DELETE FROM records WHERE section=? AND id=?", (sec, it.id))
-                    out["deleted"].append(ref); deleted.add((sec, it.id))
+                    out["deleted"].append(ref); deleted.add((sec, it.id)); chg.append(("record.deleted", sec, it.id, {"last": traj.project(json.loads(row["data"]))}))
                 else:
                     out["not_found"].append(ref)
                 continue
@@ -176,7 +331,7 @@ def _apply(conn, req, idem_key, h):
                     continue
                 conn.execute("UPDATE records SET data=?, updated_at=? WHERE section=? AND id=?",
                              (json.dumps(new, ensure_ascii=False), now, sec, it.id))
-                out["updated"].append(ref); touched.add((sec, it.id))
+                out["updated"].append(ref); touched.add((sec, it.id)); chg.append(("record.updated", sec, it.id, {"changed": traj.diff(cur, new)}))
             else:
                 new = {k: v for k, v in patch.items() if v is not None}
                 if sec == "inbox" and _inbox_violation({}, new, patch, errors, i):
@@ -190,7 +345,7 @@ def _apply(conn, req, idem_key, h):
                     continue
                 conn.execute("INSERT INTO records(section,id,data,created_at,updated_at) VALUES(?,?,?,?,?)",
                              (sec, it.id, json.dumps(new, ensure_ascii=False), now, now))
-                out["created"].append(ref); touched.add((sec, it.id))
+                out["created"].append(ref); touched.add((sec, it.id)); chg.append(("record.created", sec, it.id, {"record": traj.project(new)}))
 
     _check_refs(conn, errors, touched, deleted)
     if errors:
@@ -211,10 +366,25 @@ def _apply(conn, req, idem_key, h):
         for r in req.action_results:
             if not conn.execute("SELECT 1 FROM actions WHERE id=?", (r.id,)).fetchone():
                 errors.append({"path": "action_results.%d.id" % r.id, "msg": "no such action"}); continue
-            n_res += conn.execute("INSERT OR IGNORE INTO action_results(action_id,status,note,ts) VALUES(?,?,?,?)", (r.id, r.status, r.note, now)).rowcount
+            first = conn.execute("INSERT OR IGNORE INTO action_results(action_id,status,note,ts) VALUES(?,?,?,?)", (r.id, r.status, r.note, now)).rowcount
+            n_res += first
+            a_ = conn.execute("SELECT section,target FROM actions WHERE id=?", (r.id,)).fetchone()    # every report is kept, also a later correction of the first one
+            traj.emit(conn, now, "res:%d:%s" % (r.id, traj.short_id(r.status, r.note)), "muse.result", "muse",
+                      {"action_id": r.id, "status": r.status, "note": r.note, "primary": bool(first)}, a_["section"], a_["target"], None, r.id, "act:%d" % r.id)
         if errors:
             raise ApiError(422, "validation_error", "update rejected; nothing was applied", errors)
         out["results_recorded"] = n_res
+    n_ev = 0
+    for e in (req.events or []):
+        if e.ref_action is not None and not conn.execute("SELECT 1 FROM actions WHERE id=?", (e.ref_action,)).fetchone():
+            errors.append({"path": "events.%s.ref_action" % e.event_id, "msg": "no such action"}); continue
+        n_ev += traj.emit(conn, now, "m:" + e.event_id, e.kind, "muse",
+                          {"basis": e.basis, "source": e.source, "data": e.data}, e.section, e.target, e.thread, e.ref_action,
+                          "act:%d" % e.ref_action if e.ref_action is not None else "m:" + e.event_id)
+    if errors:
+        raise ApiError(422, "validation_error", "update rejected; nothing was applied", errors)
+    if n_ev:
+        out["events_recorded"] = n_ev
     if req.actions_seen is not None:
         top = conn.execute("SELECT COALESCE(MAX(id),0) m FROM actions").fetchone()["m"]
         cur_seen = int((conn.execute("SELECT value FROM meta WHERE key='actions_seen'").fetchone() or {"value": 0})["value"])
@@ -227,7 +397,9 @@ def _apply(conn, req, idem_key, h):
         res["journal"] = jn
     conn.execute("INSERT INTO meta(key,value) VALUES('last_update',?) "
                  "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (now,))
-    conn.execute("INSERT INTO audit(ts,idem_key,changes) VALUES(?,?,?)", (now, idem_key, json.dumps(res, ensure_ascii=False)))
+    aud = conn.execute("INSERT INTO audit(ts,idem_key,changes) VALUES(?,?,?)", (now, idem_key, json.dumps(res, ensure_ascii=False))).lastrowid
+    for kind, sec, rid, data in chg:
+        traj.emit(conn, now, "rec:%d:%s:%s" % (aud, sec, rid), kind, "muse", data, sec, rid, rid if sec == "threads" else (data.get("record") or data.get("last") or {}).get("thread"), None, "upd:%d" % aud)
     if idem_key:
         conn.execute("DELETE FROM idempotency WHERE created_at < datetime('now','-30 days')")
         conn.execute("INSERT INTO idempotency(key,body_hash,response,created_at) VALUES(?,?,?,?)",
@@ -271,6 +443,7 @@ _HUMAN = {
     "queue": {"done": "done", "reopen": "todo"},
     "deadlines": {"done": "done", "reopen": "open"},
     "threads": {"done": "done", "reopen": "active"},
+    "papers": {"save": "saved", "read_later": "read_later", "not_relevant": "not_relevant", "reopen": "recommended"},
 }
 def _impact(conn, tid):
     """What is still attached to a thread when it is archived. Informational: archiving never cascades or cancels anything."""
@@ -406,6 +579,8 @@ def apply_action(req):
                         raise ApiError(422, "validation_error", "there is nothing to resume or withdraw")
                 params = {"internal_only": True, "mirror_changes_when_muse_confirms": True}
             elif req.type in _HUMAN.get(req.section, {}):
+                if req.section == "papers" and cur.get("kind") == "day":
+                    raise ApiError(422, "validation_error", "a day marker cannot be rated")
                 if req.section == "threads" and req.type == "done":
                     if cur.get("status") in ("done", "dropped"):
                         raise ApiError(422, "validation_error", "thread is already archived")
@@ -428,6 +603,7 @@ def apply_action(req):
                                 (now, "human", req.type, req.section, req.id, json.dumps(params, ensure_ascii=False),
                                  json.dumps(cur, ensure_ascii=False), json.dumps(new, ensure_ascii=False), int(sens or (req.type == "ui_action" and bool(params.get("sensitive")))), req.request_id))
             aid = cur_.lastrowid
+            traj.human_event(conn, aid, now, req, params, cur, new, sens or (req.type == "ui_action" and bool(params.get("sensitive"))))
             if new != cur:
                 new["human"] = {"action": aid, "type": req.type, "at": now}
                 conn.execute("UPDATE records SET data=?, updated_at=? WHERE section=? AND id=?",
@@ -454,7 +630,7 @@ def _utc(ts):
 
 
 def apply_context_event(norm):
-    """Store one validated phone observation. norm = dict(type, place, observed_ts, event_id|None).
+    """Store one validated Chronicle observation. norm = dict(type, place, observed_ts, event_id|None).
     Observation only: this function never touches threads, tasks, deadlines, reminders, focus or ui_actions."""
     now = _time.time()
     ots = norm["observed_ts"]
@@ -514,8 +690,16 @@ def get_state(journal_limit=100):
         f = conn.execute("SELECT data,updated_at FROM focus").fetchone()
         state["focus"] = {**json.loads(f["data"]), "updated_at": f["updated_at"]} if f else None
         for sec in SECTIONS:
+            if sec == "papers":
+                continue
             state[sec] = [{"id": r["id"], **json.loads(r["data"]), "created_at": r["created_at"], "updated_at": r["updated_at"]}
                           for r in conn.execute("SELECT * FROM records WHERE section=? ORDER BY created_at, id", (sec,))]
+        cutoff = (local_today() - timedelta(days=30)).isoformat()
+        state["papers"] = []
+        for r in conn.execute("SELECT id,data FROM records WHERE section='papers'"):
+            d = json.loads(r["data"])
+            if d.get("kind") != "day" and (d.get("rec_date") or "") >= cutoff:
+                state["papers"].append({"id": r["id"], "title": d.get("title"), "rec_date": d.get("rec_date"), "status": d.get("status", "recommended")})
         state["context"] = _context_state(conn, now)
         state["areas"] = [{"id": a, "label": l} for a, l in AREAS]
         state["human_actions_enabled"] = len(os.environ.get("MUSE_HUMAN_TOKEN", "")) >= 16

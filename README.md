@@ -139,17 +139,19 @@ A phone automation (e.g. an iOS Shortcut) can POST `{"event":"arrived_home","dev
 
 ## Layout
 ```
-app/            FastAPI backend (main.py routes+auth, db.py storage, schema.py validation)
+app/            FastAPI backend (main.py routes+auth, db.py storage, schema.py validation, redact.py secret scrubbing,
+                trajectory.py event log + export, alphaxiv.py optional read-only paper source)
 app/protected/  click/auth/confirm layer served at /_ui/ (not editable by the frontend sandbox)
-app/static/     frontend (index.html, app.css, app.js, theme.js)
-client/         museboard.py — stdlib client for the agent
+app/static/     frontend (index.html, app.css, app.js, theme.js; monitor.html = read-only 1920x1080 wall display)
+client/         museboard.py — stdlib client for the agent; papers.py — daily paper collector
 tests/          pytest suite (API, auth, idempotency, append-only journal, XSS, DST/timezones, actions)
 ui-deploy/      optional frontend deploy gate (installer, validator, permission test, systemd template)
 MUSE.md         agent-facing API + protocol          MUSE-UI.md   frontend-sandbox contract
+MONITOR.md      wall-display page                    ALPHAXIV.md  optional alphaXiv candidate source
 ```
 
 ## Features
-Threads grouped by life area · focus · "needs you" inbox (confirm / decline / choose; sensitive items need a dialog) · 7-day view · timeline · append-only journal and action log · dark mode · optional phone geofence line.
+Threads grouped by life area · focus · "needs you" inbox (confirm / decline / choose; sensitive items need a dialog) · 7-day view · timeline · append-only journal and action log · dark mode · optional phone geofence line · **Papers** tab (≤5 recommended papers/day, deduplicated across sources, verifiable quote, human feedback) · secret redaction on write and read · append-only trajectory event log with offline export · read-only wall monitor at `/static/monitor.html` (see `MONITOR.md`).
 
 ## License
 MIT — see `LICENSE`.

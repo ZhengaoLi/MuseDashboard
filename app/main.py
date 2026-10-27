@@ -11,12 +11,14 @@ from fastapi.concurrency import run_in_threadpool
 from pydantic import ValidationError
 
 from . import db
+from . import alphaxiv
+from .redact import redact_obj
 from .schema import (ActionRequest, CHRONICLE_KNOWN_IGNORED, CHRONICLE_NATIVE, ContextCanonical, ContextNative, UpdateRequest)
 
 log = logging.getLogger("muse")
 STATIC = Path(__file__).parent / "static"
 MAX_BODY = 512 * 1024
-VERSION = "2.4.0"
+VERSION = "2.7.0"
 
 app = FastAPI(title="Muse Control", docs_url=None, redoc_url=None, openapi_url=None)
 PROTECTED = Path(__file__).parent / "protected"   # baked into the image: Muse's frontend sandbox cannot edit it
@@ -88,7 +90,30 @@ def health():
 
 @app.get("/api/state")
 def state(journal: int = 100):
-    return db.get_state(max(1, min(journal, 1000)))
+    return redact_obj(db.get_state(max(1, min(journal, 1000))))      # secrets stored earlier (append-only history) are never served
+
+
+@app.get("/api/papers/source/alphaxiv")
+async def papers_alphaxiv(request: Request, feed: str = "hot", limit: int = 30):
+    """Candidate ids from alphaXiv's free feeds (read-only wrapper, key stays on the server). Muse token required; never an error status for upstream trouble."""
+    bad = _check_auth(request)
+    if bad:
+        return bad
+    if feed not in alphaxiv.FEEDS:
+        return err(422, "validation_error", "feed must be hot or for_you")
+    if not 1 <= limit <= 200:
+        return err(422, "validation_error", "limit must be 1..200")
+    return await run_in_threadpool(alphaxiv.safe_feed, feed, limit)
+
+
+@app.get("/api/papers")
+def papers(days: int = 7, before: str = ""):
+    from .schema import check_day
+    try:
+        before = check_day(before) if before else None
+    except ValueError:
+        return err(422, "validation_error", "before must be YYYY-MM-DD")
+    return redact_obj(db.get_papers(max(1, min(days, 60)), before))
 
 
 def _check_auth(request: Request):
@@ -119,6 +144,8 @@ async def update(request: Request):
     hdr_key = request.headers.get("idempotency-key")
     if hdr_key:
         payload.setdefault("idempotency_key", hdr_key)
+    warnings = []
+    payload = redact_obj(payload, "", warnings)      # a secret never reaches the database; the warning names the path, not the value
     try:
         req = UpdateRequest.model_validate(payload)
     except ValidationError as e:
@@ -128,6 +155,8 @@ async def update(request: Request):
         return err(422, "validation_error",
                    "empty update: send at least one of focus, queue, deadlines, projects, schedule, automations, journal, heartbeat")
     res = await run_in_threadpool(db.apply_update, req, payload, req.idempotency_key)
+    if warnings:
+        res = {**res, "warnings": [{"path": w["path"], "msg": "possible secret (%s) was replaced with [redacted]; never send credentials, tokens or codes" % ", ".join(w["found"])} for w in warnings[:20]]}
     return res
 
 
@@ -185,7 +214,7 @@ def _parse_when(s):
 
 @app.post("/api/context/events")
 async def context_event(request: Request):
-    """Phone geofence events (observations only). Own token; whitelisted vocabulary; deduped; ordered by observed time."""
+    """Chronicle phone geofence events (observations only). Own token; whitelisted vocabulary; deduped; ordered by observed time."""
     bad = _check_chronicle(request)
     if bad:
         return bad

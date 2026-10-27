@@ -4,7 +4,7 @@ set -euo pipefail
 P="$(cd "$(dirname "$0")/.." && pwd)"; D="$P/.devroot"
 rm -rf "$D"; mkdir -p "$D/opt/validator-ctx/ref" "$D/srv"
 cp "$P/ui-deploy/validator/Dockerfile" "$P/ui-deploy/validator/checks.py" "$D/opt/validator-ctx/"
-cp -r "$P/app" "$P/tests" "$P/pytest.ini" "$D/opt/validator-ctx/ref/"; find "$D" -name __pycache__ -prune -exec rm -rf {} +
+cp -r "$P/app" "$P/client" "$P/tests" "$P/pytest.ini" "$D/opt/validator-ctx/ref/"; find "$D" -name __pycache__ -prune -exec rm -rf {} +
 cp -r "$P/app/static" "$D/opt/initial-static"
 cat > "$D/config.json" <<JSON
 {"root":"$D/srv","docker":"/usr/bin/docker","home":"/tmp","prod_url":"http://127.0.0.1:5052","prod_image":"muse-control:latest",
